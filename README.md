@@ -81,9 +81,14 @@ The model gets this legend once, in the CTM part of its system prompt (cached).
   - `reset: "compact"` (with `instructions`) or `"clear"` runs that reset **first**, then the
     switch. A switch rebuilds the prompt cache for the whole conversation on the new model, so
     with a large context the combination is much cheaper.
-  - If the host, an allowlist or a policy refuses the model (or the name is unknown), the model
-    stays as it was and the resume prompt arrives with the reason. If the reset fails, the
-    switch is skipped too. An alias the host does not list is refused at once.
+  - **First it checks that the model exists**, right when the tool is called: an alias from the
+    `/config` Model row counts as existing; any other name gets a one-token test request (the
+    API answers `404 model_not_found` for an unknown name, the engine refuses a model a policy or
+    allowlist blocks). If the check fails, nothing is scheduled and the model is told which check
+    failed and why.
+  - If the switch itself then fails, the model stays as it was and the resume prompt arrives with
+    the command that was run (`/model <name>`) and the engine's answer verbatim. If the reset
+    fails, the switch is skipped too.
   - Main agent only; shares the `resetCooldownMinutes` gap with `reset`; dropped if you
     interrupt the turn.
 

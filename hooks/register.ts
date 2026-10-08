@@ -66,6 +66,7 @@ const IDLE_TICK_MS = 30_000
 const RESET_DELAY_MS = 1_000
 const COMPACT_CONFIRM_MS = 10 * 60_000
 const CLEAR_CONFIRM_MS = 2 * 60_000
+const CHECK_TIMEOUT_MS = 30_000
 
 const MINUTE = 60_000
 
@@ -573,6 +574,26 @@ function isModelName(s: string): boolean {
   return /^[A-Za-z0-9][\w.:\/@-]*(\[\w+\])?$/.test(s) && s.length <= 200
 }
 
+// Does the model exist and may this session use it? Aliases the host lists exist; any
+// other name gets a one-token test request, resolved and allowlist-checked like
+// --model: the API answers 404 model_not_found for a name it does not know, and the
+// engine refuses a model a policy blocks. Only a call cut short leaves it open (null):
+// the switch itself still checks.
+async function checkModel($: EngineInterface, model: string, options: string[]): Promise<{ check: string; error: string | null }> {
+  if (options.includes(model)) return { check: 'listed in the /config Model row', error: null }
+  const check = `a one-token test request to "${model}"`
+  try {
+    const r = await $.model.complete({ model, prompt: 'Reply with: ok', maxTokens: 1, timeoutMs: CHECK_TIMEOUT_MS })
+    refusedBy(r)
+    if (r.isAnswered || r.reason !== 'api-error') return { check, error: null }
+    const status = (r as { status?: number }).status
+    const kind = (r as { error?: string }).error
+    return { check, error: `the API answered ${[status, kind].filter(x => x !== undefined).join(' ') || 'with an error'}` }
+  } catch (err) {
+    return { check, error: `the engine refused it: ${errorText(err)}` }
+  }
+}
+
 // Switches through /model <name> – for this session only, never in the settings – and
 // checks the outcome: the command answers "Set model to …" on success, and a name it
 // does not know or a policy refusal leaves the model as it was.
@@ -594,8 +615,9 @@ async function switchModel($: EngineInterface, model: string): Promise<{ ok: boo
   return {
     ok,
     note:
-      `[CTM] The switch to model "${model}" you scheduled failed: ${text || 'the engine gave no answer'}. ` +
-      `You are still on ${after ?? before ?? 'the previous model'}. See ${T_MODELS} for what is available.`,
+      `[CTM] The switch to model "${model}" you scheduled failed. Command: /model ${model} – the engine answered: ` +
+      `${text ? `"${text}"` : 'nothing'}. You are still on ${after ?? before ?? 'the previous model'}. ` +
+      `See ${T_MODELS} for what is available.`,
   }
 }
 
@@ -1172,21 +1194,28 @@ export const register: Register = (on, options) => {
         deny: `CTM: reset "compact" needs "instructions" (at least ${MIN_INSTRUCTION_CHARS} characters): what the summary must keep.`,
       }
     }
-    const info = await modelInfo($)
-    // An alias the host does not list is refused at once; anything shaped like a full id goes to the engine.
-    if (info.options.length > 0 && !info.options.includes(model) && !model.includes('-')) {
-      return { deny: `CTM: unknown model "${model}". Available: ${info.options.join(', ')} – or a full model ID.` }
-    }
     const now = await $.clock.now()
     const wait = lastResetAt + cooldownMs - now
     if (wait > 0) return { deny: `CTM: the last reset or model switch was too recent. Next one possible ${fmtIn(wait)}.` }
+
+    // First: does the model exist (and may this session use it)? Only then is the switch scheduled.
+    const info = await modelInfo($)
+    const { check, error } = await checkModel($, model, info.options)
+    if (error) {
+      return {
+        deny:
+          `CTM: model "${model}" is not available – nothing was scheduled. Check: ${check}; ${error}. ` +
+          `Available: ${info.options.length > 0 ? info.options.join(', ') : 'see ' + T_MODELS} – or a full model ID.`,
+      }
+    }
 
     const replaced = pending !== null
     pending = { mode, model, instructions: mode === 'compact' ? instructions : null, resumePrompt }
     toast($, `CTM: the model scheduled a ${describeJob(pending)} for the end of this turn`)
     return {
       result:
-        `CTM: ${describeJob(pending)} scheduled for the end of this turn (now on ${info.current ?? 'unknown'})` +
+        `CTM: model "${model}" checked (${check}). ` +
+        `${describeJob(pending)} scheduled for the end of this turn (now on ${info.current ?? 'unknown'})` +
         `${replaced ? '; replaces the reset or switch scheduled before' : ''}.` +
         `${info.locked ? ' Note: the Model setting is locked by a policy – the switch may be refused.' : ''} ` +
         'Finish your answer now; you will then receive your resume prompt.',

@@ -26,7 +26,7 @@ const MODEL_IDS: Record<string, string> = {
   'claude-haiku-5-5': 'claude-haiku-5-5',
 }
 
-function world(on: On, initial: Usage = USAGE, opts: { headless?: boolean; lockedModel?: boolean; refuseModel?: string } = {}) {
+function world(on: On, initial: Usage = USAGE, opts: { headless?: boolean; lockedModel?: boolean; refuseModel?: string; blockedModel?: string } = {}) {
   const usage = { current: initial }
   const model = { current: 'claude-opus-5-5' }
   const seen = {
@@ -36,8 +36,20 @@ function world(on: On, initial: Usage = USAGE, opts: { headless?: boolean; locke
     tools: [] as { name: string; description: string }[],
     usage,
     model,
+    checks: [] as string[],
   }
   on('session.model', () => ({ value: model.current }) as never)
+  // The existence check: a one-token request; 404 for a name the API does not know.
+  on('model.complete', (_$, e) => {
+    seen.checks.push(e.model)
+    if (opts.blockedModel === e.model) return { deny: `model "${e.model}" is not in the allowed models of your organization` }
+    const zero = { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
+    return {
+      value: MODEL_IDS[e.model]
+        ? { isAnswered: true, text: 'ok', usage: zero }
+        : { isAnswered: false, reason: 'api-error', status: 404, error: 'model_not_found', usage: zero },
+    } as never
+  })
   on('config.list', () =>
     ({
       value: [
@@ -750,9 +762,41 @@ describe('switch_model', () => {
     world(on)
     expect((await $.tool.call({ tool: 'mcp__ctm__switch_model', model: 'haiku' } as never)).deny).toMatch(/resumePrompt/)
     expect((await $.tool.call(sw({ model: 'haiku', agentId: 'sub-1' }))).deny).toMatch(/main agent/)
-    expect((await $.tool.call(sw({ model: 'gpt' }))).deny).toMatch(/unknown model "gpt".*Available: default, sonnet/)
     expect((await $.tool.call(sw({ model: 'two words' }))).deny).toMatch(/alias or a full model ID/)
     expect((await $.tool.call(sw({ model: 'haiku', reset: 'compact' }))).deny).toMatch(/instructions/)
+  })
+
+  test('checks first whether the model exists; schedules nothing if not', async ($, on) => {
+    const seen = world(on)
+    const clock = mock.clock(on, { now: 1_000_000 })
+    on('turn.complete', () => ({ text: '' }) as never)
+
+    const r = await $.tool.call(sw({ model: 'claude-nonexistent-1' }))
+    expect(r.deny).toContain('model "claude-nonexistent-1" is not available – nothing was scheduled.')
+    expect(r.deny).toContain('Check: a one-token test request to "claude-nonexistent-1"; the API answered 404 model_not_found.')
+    expect(r.deny).toContain('Available: default, sonnet, opus, haiku')
+    expect(seen.checks).toEqual(['claude-nonexistent-1'])
+
+    await $.turn.complete(turn)
+    await clock.advance(2_000)
+    expect(seen.commands).toEqual([])
+    expect(seen.prompts).toEqual([])
+  })
+
+  test('a model a policy blocks is refused at the check, with the engine’s reason', async ($, on) => {
+    world(on, USAGE, { blockedModel: 'claude-haiku-5-5' })
+    mock.clock(on, { now: 1_000_000 })
+    const r = await $.tool.call(sw({ model: 'claude-haiku-5-5' }))
+    expect(r.deny).toContain('nothing was scheduled')
+    expect(r.deny).toMatch(/the engine refused it: .*model "claude-haiku-5-5" is not in the allowed models of your organization/)
+  })
+
+  test('a listed alias needs no test request; a full id gets one', async ($, on) => {
+    const seen = world(on)
+    mock.clock(on, { now: 1_000_000 })
+    expect(String((await $.tool.call(sw({ model: 'haiku' }))).result)).toContain('checked (listed in the /config Model row)')
+    expect(String((await $.tool.call(sw({ model: 'claude-haiku-5-5' }))).result)).toContain('checked (a one-token test request')
+    expect(seen.checks).toEqual(['claude-haiku-5-5'])
   })
 
   test('switches after the turn through /model and sends the resume prompt with the new model', async ($, on) => {
@@ -840,19 +884,9 @@ describe('switch_model', () => {
     expect(seen.model.current).toBe('claude-opus-5-5')
     expect(seen.prompts.length).toBe(1)
     expect(seen.prompts[0]).toContain(
-      `[CTM] The switch to model "opus" you scheduled failed: Model 'opus' is not allowed by your organization's policy. You are still on claude-opus-5-5.`,
+      `[CTM] The switch to model "opus" you scheduled failed. Command: /model opus – the engine answered: "Model 'opus' is not allowed by your organization's policy". You are still on claude-opus-5-5.`,
     )
     expect(seen.prompts[0]).toContain(RESUME)
-  })
-
-  test('a model id the engine does not know is reported as failed', async ($, on) => {
-    const seen = world(on)
-    const clock = mock.clock(on, { now: 1_000_000 })
-    on('turn.complete', () => ({ text: '' }) as never)
-    await $.tool.call(sw({ model: 'claude-nonexistent-1' }))
-    await $.turn.complete(turn)
-    await clock.advance(2_000)
-    expect(seen.prompts[0]).toContain(`failed: Model 'claude-nonexistent-1' not found. You are still on claude-opus-5-5.`)
   })
 
   test('a failed reset skips the switch', async ($, on) => {

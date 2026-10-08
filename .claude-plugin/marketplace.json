@@ -1,0 +1,6 @@
+{
+  "name": "ctm",
+  "description": "CTM – Context and Token Manager for Claude Code",
+  "owner": { "name": "AlexCherrypi" },
+  "plugins": [{ "name": "ctm", "source": "./" }]
+}

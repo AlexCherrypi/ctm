@@ -1,0 +1,52 @@
+{
+  "name": "ctm",
+  "version": "0.6.2",
+  "description": "Context and Token Manager: keeps the model informed about its context window and the 5-hour / 7-day rate limits, each with its change since the last report, and lets it compact or clear itself – always with a resume prompt.",
+  "author": {
+    "name": "AlexCherrypi"
+  },
+  "userConfig": {
+    "intervalMinutes": {
+      "type": "number",
+      "title": "Update interval (minutes)",
+      "description": "Default for how often CTM attaches the current figures while the model works, and the interval of idle updates and limit wake-up checks (1–60). The model (settings tool) or /ctm interval can override it.",
+      "default": 3
+    },
+    "compactThreshold": {
+      "type": "string",
+      "title": "Compact threshold",
+      "description": "Context size from which CTM reminds the model to compact when its task allows: tokens (300k) or percent of the window (30%). 'off' = no threshold and no reminders to ask. Empty = unset: CTM nudges the model now and then to ask you for one. The model (settings tool) or /ctm compact can override it.",
+      "default": ""
+    },
+    "fiveHourPauseAt": {
+      "type": "number",
+      "title": "Pause at 5-hour limit (%)",
+      "description": "From this usage of the 5-hour limit on, CTM asks the model to pause and wake itself once it is back below. 0 = off.",
+      "default": 0
+    },
+    "sevenDayPauseAt": {
+      "type": "number",
+      "title": "Pause at 7-day limit (%)",
+      "description": "From this usage of the 7-day limit on, CTM asks the model to pause and wake itself once it is back below. 0 = off.",
+      "default": 0
+    },
+    "resetCooldownMinutes": {
+      "type": "number",
+      "title": "Minimum time between compact/clear (minutes)",
+      "description": "Guards against loops in which the model keeps resetting itself.",
+      "default": 10
+    },
+    "attachToPrompts": {
+      "type": "boolean",
+      "title": "Attach figures to your prompts",
+      "description": "Attaches the current figures for the model to every prompt you send.",
+      "default": true
+    },
+    "timeZone": {
+      "type": "string",
+      "title": "Time zone (IANA)",
+      "description": "Time zone for every time CTM shows, e.g. Europe/Berlin. Empty = detect automatically (TZ, /etc/localtime, system), else UTC.",
+      "default": ""
+    }
+  }
+}

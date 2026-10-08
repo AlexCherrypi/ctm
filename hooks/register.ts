@@ -1,0 +1,1039 @@
+import type { EngineInterface, Register } from 'claude-code'
+
+// CTM – Context and Token Manager
+//
+// 1. Keeps the model informed about its context window and the 5h/7d rate limits,
+//    each with its change since the previous report, in a short block:
+//    - on every user prompt (can be turned off)
+//    - while it works, at most every N minutes on a tool result
+//    - while idle, if the model turned that on (each update starts a turn)
+//    - on demand through the `status` tool
+// 2. Lets the model compact or clear its own conversation – only with a resume
+//    prompt, and a compact only with instructions for the summary.
+// 3. A short CTM briefing sits in the system prompt for good (it survives compact
+//    and clear) and is sent once more after every CTM reset.
+// 4. Settings the model (`settings` tool) or the person (/ctm, userConfig) can set:
+//    the update interval, a compact threshold (the blocks remind the model to compact
+//    once the context passes it; while it is unset they remind it now and then to ask
+//    the person for one), and pause thresholds for the 5-hour and 7-day limits (the
+//    blocks ask the model to pause past them; `limit_wakeup` wakes it once the limit
+//    is back below).
+//
+// Settings are kept across sessions in $.store. Everything else lives in module
+// variables: it survives /clear (the module is not reloaded then) and is scoped to
+// this session; a reload of the mod starts it over.
+
+type Mode = 'compact' | 'clear'
+type PendingReset = { mode: Mode; instructions: string | null; resumePrompt: string }
+type IdleWatch = { until: number | null }
+type LimitReading = { percent: number; resetsAt: string | null }
+type Snapshot = {
+  at: number
+  contextTokens: number | null
+  limits: Record<string, LimitReading>
+}
+type LimitKind = 'five_hour' | 'seven_day'
+// What the model or the person set; a missing key falls back to userConfig.
+type Settings = {
+  intervalMinutes?: number
+  compactThreshold?: string // "300k", "300000", "30%" or "off"
+  pauseAt?: Partial<Record<LimitKind, number>> // percent; 0 = off
+}
+type LimitWatch = { kind: LimitKind; below: number; note: string }
+
+const PREFIX = 'mcp__ctm__'
+const T_STATUS = 'mcp__ctm__status'
+const T_IDLE = 'mcp__ctm__idle_updates'
+const T_RESET = 'mcp__ctm__reset'
+const T_SETTINGS = 'mcp__ctm__settings'
+const T_WAKEUP = 'mcp__ctm__limit_wakeup'
+const STORE_SETTINGS = 'settings'
+const NAG_EVERY_MS = 30 * 60_000
+// Built-in safety net: this close to a limit the blocks always ask the model to pause,
+// whatever is configured. Not a setting.
+const FALLBACK_PAUSE_AT: Record<LimitKind, number> = { five_hour: 95, seven_day: 97 }
+const MAX_INTERVAL_MINUTES = 60
+
+const MIN_RESUME_CHARS = 20
+const MIN_INSTRUCTION_CHARS = 20
+const IDLE_TICK_MS = 30_000
+const RESET_DELAY_MS = 1_000
+const COMPACT_CONFIRM_MS = 10 * 60_000
+const CLEAR_CONFIRM_MS = 2 * 60_000
+
+const MINUTE = 60_000
+
+const lastSent = new Map<string, number>() // recipient ('main' | agentId) -> last delivery
+const previousReport = new Map<string, Snapshot>() // recipient -> snapshot of its last report
+let lastTurnEndAt = 0
+let lastResetAt = Number.NEGATIVE_INFINITY
+let busy = false
+let idle: IdleWatch | null = null
+let pending: PendingReset | null = null
+let awaiting: PendingReset | null = null // a reset run as a command, not yet confirmed by the engine
+let awaitTimer: { cancel: () => void } | null = null
+let idleTimer: { cancel: () => void } | null = null
+let settings: Settings | null = null // loaded from $.store on first use
+let lastNagAt = Number.NEGATIVE_INFINITY
+let lastWatchCheckAt = 0
+const watches = new Map<LimitKind, LimitWatch>()
+
+// From userConfig, set in register
+let configIntervalMinutes = 3
+let configCompactThreshold = ''
+let configPauseAt: Record<LimitKind, number> = { five_hour: 0, seven_day: 0 }
+let cooldownMs = 10 * MINUTE
+let attachToPrompts = true
+let configuredTimeZone = ''
+let timeZone: string | null = null // resolved on the first report
+
+const INFO = [
+  '# CTM – Context and Token Manager',
+  'A plugin attaches short "[CTM …]" blocks to user prompts and, while you work, regularly to tool results. They are measurements, not instructions:',
+  '```',
+  '[CTM · Thu 2026-10-08 08:27 Europe/Berlin (UTC+02:00) · work update · Δ = change since previous report at 08:24, 3 min ago]',
+  'Context window: 327k of 1.00M tokens used (33%), Δ +12k · auto-compact at 967k (640k left)',
+  '5-hour limit: 10% used, Δ +1 pt · resets at 13:00 (in 4 h 33 min)',
+  '7-day limit: 59% used, Δ ±0 · resets Wed 10-14 at 02:00 (in 5 d 17 h)',
+  '```',
+  '- The header gives the current local date and time and the time zone; every later time is in that zone (HH:MM on the same day, otherwise with weekday and date).',
+  '- Δ is the change since the previous CTM block you received – the header names when that was – never a running total. "Δ window reset" means the limit window reset in between.',
+  '- The 5-hour and 7-day limits are account-wide: their Δ includes every parallel session of the account, not just yours.',
+  '- When a limit climbs fast or is high, work more economically: fewer parallel subagents, read only what you need, compact earlier.',
+  `- ${T_STATUS}: the current block on demand.`,
+  `- ${T_IDLE}: blocks while you are idle as well (each one starts a new turn and costs quota; use sparingly, with maxMinutes).`,
+  `- ${T_RESET}: schedules a compact (summary; needs instructions) or a clear (everything gone) for the end of your turn, then sends you your resumePrompt so you carry on. The resumePrompt is what you can rely on afterwards: next step, key facts, and every important rule – no length limit, be complete; or write them to a file and give its exact path in the resumePrompt.`,
+  'A good moment for compact/clear is right after finishing a sub-task, before the context gets tight – never in the middle of a change.',
+  `- ${T_SETTINGS}: how often these blocks come (1–${MAX_INTERVAL_MINUTES} min), a compact threshold (tokens like 300k, or a % of the window), and pause thresholds for the 5-hour and 7-day limits. No arguments = show the current settings. Kept across sessions.`,
+  '- Past the compact threshold the blocks remind you to compact: do it at the next clean point if your task allows it (a smaller context makes every further request cheaper on the limits) – never break off critical work for it.',
+  '- Built-in safety net, always active and not configurable: from 95% of the 5-hour limit and 97% of the 7-day limit the blocks ask you to pause, even with no pause threshold set.',
+  `- Past a pause threshold the blocks ask you to pause: at a clean point call ${T_WAKEUP} and end your turn; you are woken once the limit is back below. You can also use ${T_WAKEUP} on your own, e.g. "wake me when the 5-hour window has reset".`,
+].join('\n')
+
+// ---------------------------------------------------------------- Settings
+
+function isLimitKind(k: unknown): k is LimitKind {
+  return k === 'five_hour' || k === 'seven_day'
+}
+
+async function ensureSettings($: EngineInterface): Promise<Settings> {
+  if (settings) return settings
+  const stored = await safe(() => $.store.get(STORE_SETTINGS))
+  settings = stored && typeof stored === 'object' ? { ...(stored as Settings) } : {}
+  return settings
+}
+
+async function saveSettings($: EngineInterface, next: Settings): Promise<void> {
+  settings = next
+  await safe(() => $.store.set(STORE_SETTINGS, next))
+}
+
+function clampInterval(n: number): number {
+  return Math.min(MAX_INTERVAL_MINUTES, Math.max(1, Math.round(n)))
+}
+
+function intervalMinutes(): number {
+  return settings?.intervalMinutes ?? configIntervalMinutes
+}
+
+function intervalMs(): number {
+  return intervalMinutes() * MINUTE
+}
+
+// "" = unset (the blocks nag), "off" = declined (no nagging), else a threshold.
+function compactThresholdSetting(): string {
+  return settings?.compactThreshold ?? configCompactThreshold
+}
+
+type Threshold = { tokens: number } | { percent: number }
+
+// 300000, "300000", "300k", "1.2m", "30%"; null when it is no threshold.
+function parseThreshold(raw: unknown): Threshold | null {
+  const s = String(raw ?? '').trim().toLowerCase().replace(/[\s_.,](?=\d{3}\b)/g, '')
+  const m = s.match(/^(\d+(?:\.\d+)?)\s*(k|m|%)?$/)
+  if (!m) return null
+  const n = Number(m[1])
+  if (m[2] === '%') return n > 0 && n <= 100 ? { percent: n } : null
+  const tokens = Math.round(n * (m[2] === 'k' ? 1_000 : m[2] === 'm' ? 1_000_000 : 1))
+  return tokens >= 1_000 ? { tokens } : null
+}
+
+function thresholdTokens(t: Threshold, window: number): number {
+  return 'tokens' in t ? t.tokens : Math.round((window * t.percent) / 100)
+}
+
+function fmtThreshold(t: Threshold): string {
+  return 'tokens' in t ? fmtTokens(t.tokens) : fmtPercent(t.percent)
+}
+
+function pauseAt(kind: LimitKind): number {
+  return settings?.pauseAt?.[kind] ?? configPauseAt[kind]
+}
+
+// A reading whose window has reset since it was taken: rate limits come with the
+// responses, so while the model pauses the last reading stays the one before the reset.
+function readingIsStale(r: { resetsAt?: string }, now: number): boolean {
+  return r.resetsAt !== undefined && Date.parse(r.resetsAt) <= now
+}
+
+function describeSettings(): string {
+  const ct = compactThresholdSetting()
+  const parsed = parseThreshold(ct)
+  const compact = ct === 'off' ? 'off (declined)' : parsed ? fmtThreshold(parsed) : 'not set (blocks remind you to ask)'
+  const pause = (k: LimitKind) => (pauseAt(k) > 0 ? fmtPercent(pauseAt(k)) : 'off')
+  const lines = [
+    'CTM settings:',
+    `- intervalMinutes: ${intervalMinutes()} (work and idle updates)`,
+    `- compactThreshold: ${compact}`,
+    `- fiveHourPauseAt: ${pause('five_hour')}`,
+    `- sevenDayPauseAt: ${pause('seven_day')}`,
+  ]
+  if (watches.size > 0) {
+    lines.push(
+      `- limit wake-ups armed: ${[...watches.values()].map(w => `${limitName(w.kind)} below ${fmtPercent(w.below)}`).join(', ')}`,
+    )
+  }
+  return lines.join('\n')
+}
+
+type SettingsChange = {
+  intervalMinutes?: unknown
+  compactThreshold?: unknown
+  fiveHourPauseAt?: unknown
+  sevenDayPauseAt?: unknown
+}
+
+// Applies what is given (null = back to the default); returns an error or null.
+async function changeSettings($: EngineInterface, change: SettingsChange): Promise<string | null> {
+  const next: Settings = { ...(await ensureSettings($)), pauseAt: { ...(settings?.pauseAt ?? {}) } }
+
+  if (change.intervalMinutes === null) delete next.intervalMinutes
+  else if (change.intervalMinutes !== undefined) {
+    const n = Number(change.intervalMinutes)
+    if (!Number.isFinite(n) || n < 1) return `intervalMinutes must be a number from 1 to ${MAX_INTERVAL_MINUTES}.`
+    next.intervalMinutes = clampInterval(n)
+  }
+
+  if (change.compactThreshold === null || change.compactThreshold === 'default') delete next.compactThreshold
+  else if (change.compactThreshold !== undefined) {
+    const raw = String(change.compactThreshold).trim().toLowerCase()
+    if (raw === 'off') next.compactThreshold = 'off'
+    else {
+      const t = parseThreshold(raw)
+      if (!t) return 'compactThreshold must be tokens (e.g. 300k or 300000), a percent of the window (e.g. 30%), "off" or null.'
+      next.compactThreshold = fmtThreshold(t)
+    }
+  }
+
+  for (const [key, kind] of [
+    ['fiveHourPauseAt', 'five_hour'],
+    ['sevenDayPauseAt', 'seven_day'],
+  ] as const) {
+    const v = change[key]
+    if (v === null || v === 'default') delete next.pauseAt![kind]
+    else if (v !== undefined) {
+      const n = v === 'off' ? 0 : Number(String(v).replace('%', ''))
+      if (!Number.isFinite(n) || n < 0 || n > 100) return `${key} must be a percent from 1 to 100, "off" (0) or null.`
+      next.pauseAt![kind] = n
+    }
+  }
+  if (Object.keys(next.pauseAt!).length === 0) delete next.pauseAt
+
+  await saveSettings($, next)
+  return null
+}
+
+// Right after a change: the settings plus the current block, so a threshold that is
+// already passed shows at once (as a ⚑ line), not only with the next block.
+async function settingsAnswer($: EngineInterface, changed: boolean): Promise<string> {
+  const block = await report($, changed ? 'settings changed' : 'settings')
+  const passed = block.split('\n').filter(l => l.startsWith('⚑') && !l.includes('No compact threshold set'))
+  const head = passed.length > 0 && changed
+    ? 'Saved. ATTENTION: a threshold you just set is already passed – see the ⚑ lines below and act on them.'
+    : changed
+      ? 'Saved. No threshold is passed right now.'
+      : ''
+  return [head, describeSettings(), '', block].filter((x, i) => i > 0 || x).join('\n')
+}
+
+// A notice for the person; must never get in the way of the actual work.
+function toast($: EngineInterface, text: string): void {
+  void Promise.resolve()
+    .then(() => $.ui.toast(text))
+    .catch(() => undefined)
+}
+
+function fmtTokens(n: number): string {
+  const abs = Math.abs(n)
+  if (abs >= 1_000_000) return `${(n / 1_000_000).toFixed(2)}M`
+  if (abs >= 10_000) return `${Math.round(n / 1000)}k`
+  if (abs >= 1_000) return `${(n / 1000).toFixed(1).replace(/\.0$/, '')}k`
+  return String(n)
+}
+
+function fmtSigned(n: number, fmt: (n: number) => string): string {
+  return n > 0 ? `+${fmt(n)}` : n < 0 ? `-${fmt(-n)}` : '±0'
+}
+
+// 4 h 37 min, 5 d 17 h, 50 min, <1 min
+function fmtDuration(ms: number): string {
+  const m = Math.round(Math.abs(ms) / MINUTE)
+  if (m < 1) return '<1 min'
+  if (m < 60) return `${m} min`
+  const h = Math.floor(m / 60)
+  return h < 48 ? `${h} h ${m % 60} min` : `${Math.floor(h / 24)} d ${h % 24} h`
+}
+
+function fmtIn(ms: number): string {
+  return ms <= 0 ? 'now' : `in ${fmtDuration(ms)}`
+}
+
+// Span between two shown clock times. Both are cut to the minute first, the way
+// they are printed, so "06:43 … 06:46" always reads "3 min" and never "4 min".
+function fmtSpan(from: number, to: number): string {
+  return fmtDuration((Math.floor(to / MINUTE) - Math.floor(from / MINUTE)) * MINUTE)
+}
+
+function fmtPercent(n: number): string {
+  return `${Math.round(n * 10) / 10}%`
+}
+
+// One time zone everywhere. Order: userConfig `timeZone`, the TZ variable,
+// /etc/localtime or /etc/timezone (Linux, macOS, containers), the system's Intl
+// zone, else UTC. Resolved once per load of the mod.
+function isValidTimeZone(tz: string): boolean {
+  if (!tz) return false
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: tz })
+    return true
+  } catch {
+    return false
+  }
+}
+
+async function safe<T>(fn: () => Promise<T>): Promise<T | undefined> {
+  try {
+    return await fn()
+  } catch {
+    return undefined
+  }
+}
+
+async function ensureTimeZone($: EngineInterface): Promise<string> {
+  if (timeZone !== null) return timeZone
+  const candidates: (string | undefined)[] = [configuredTimeZone]
+  candidates.push((await safe(() => $.env.get('TZ')))?.replace(/^:/, ''))
+  const localtime = await safe(() => $.fs.stat('/etc/localtime', { resolve: true }))
+  candidates.push(localtime?.realPath?.match(/zoneinfo\/(.+)$/)?.[1])
+  candidates.push((await safe(() => $.fs.read('/etc/timezone')))?.trim())
+  try {
+    candidates.push(Intl.DateTimeFormat().resolvedOptions().timeZone)
+  } catch {
+    // no system zone from Intl
+  }
+  timeZone = candidates.map(c => c?.trim() ?? '').find(isValidTimeZone) ?? 'UTC'
+  return timeZone
+}
+
+const WEEKDAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
+
+type LocalTime = { date: string; year: string; monthDay: string; time: string; weekday: string; offset: string }
+
+function localTime(ms: number): LocalTime {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: timeZone ?? 'UTC',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hourCycle: 'h23',
+    timeZoneName: 'longOffset',
+  }).formatToParts(new Date(ms))
+  const get = (type: string) => parts.find(p => p.type === type)?.value ?? '??'
+  const year = get('year')
+  const monthDay = `${get('month')}-${get('day')}`
+  return {
+    date: `${year}-${monthDay}`,
+    year,
+    monthDay,
+    time: `${get('hour')}:${get('minute')}`,
+    weekday: WEEKDAYS[new Date(Date.UTC(+year, +get('month') - 1, +get('day'))).getUTCDay()] ?? '???',
+    offset: get('timeZoneName').replace(/^GMT$/, 'GMT+00:00').replace(/^GMT/, 'UTC'),
+  }
+}
+
+// The header's full stamp: Thu 2026-10-08 08:22 Europe/Berlin (UTC+02:00)
+function fmtStamp(ms: number): string {
+  const t = localTime(ms)
+  return `${t.weekday} ${t.date} ${t.time} ${timeZone ?? 'UTC'} (${t.offset})`
+}
+
+// Any other time, relative to the header's: 13:00 the same day, "Wed 10-14 02:00" on
+// another, with the year when that differs, and with the offset when it differs (DST).
+function fmtClock(ms: number, ref: number): string {
+  const t = localTime(ms)
+  const r = localTime(ref)
+  let s = t.date === r.date ? t.time : `${t.weekday} ${t.year === r.year ? t.monthDay : t.date} ${t.time}`
+  if (t.offset !== r.offset) s += ` (${t.offset})`
+  return s
+}
+
+const LIMIT_NAMES: Record<string, string> = {
+  five_hour: '5-hour limit',
+  seven_day: '7-day limit',
+  spend_limit: 'Spend limit',
+}
+
+function limitName(kind: string): string {
+  return LIMIT_NAMES[kind] ?? kind
+}
+
+// ---------------------------------------------------------------- Deltas
+
+// Every figure carries one delta against the previous report the same recipient got:
+// the context in tokens, each limit in points. Nothing is compared across more than
+// that one window.
+function limitDelta(before: LimitReading | undefined, now: LimitReading, at: number): string | null {
+  if (!before) return null
+  const resetBetween =
+    before.resetsAt !== null &&
+    now.resetsAt !== null &&
+    Math.abs(Date.parse(now.resetsAt) - Date.parse(before.resetsAt)) > MINUTE &&
+    Date.parse(before.resetsAt) <= at
+  if (resetBetween) {
+    return `Δ window reset at ${fmtClock(Date.parse(before.resetsAt as string), at)} (was ${fmtPercent(before.percent)})`
+  }
+  const points = Math.round((now.percent - before.percent) * 10) / 10
+  return points === 0 ? 'Δ ±0' : `Δ ${fmtSigned(points, String)} pt${Math.abs(points) === 1 ? '' : 's'}`
+}
+
+// "at 13:00" the same day, "Wed 10-14 at 02:00" on another
+function fmtAt(ms: number, ref: number): string {
+  const s = fmtClock(ms, ref)
+  const i = s.lastIndexOf(' ', s.indexOf(':'))
+  return i < 0 ? `at ${s}` : `${s.slice(0, i)} at ${s.slice(i + 1)}`
+}
+
+// ---------------------------------------------------------------- The report
+
+// `recipient` is whoever reads this block ('main' or a subagent's id); deltas are
+// measured against the previous report that same recipient got.
+async function report($: EngineInterface, reason: string, recipient = 'main'): Promise<string> {
+  await ensureTimeZone($)
+  await ensureSettings($)
+  const now = await $.clock.now()
+  const u = await $.session.usage({ breakdown: 'summary' })
+  const prev = previousReport.get(recipient)
+  const c = u.context
+  const threshold = c.breakdown?.autoCompactThreshold
+
+  const window = prev
+    ? `Δ = change since previous report ${fmtAt(prev.at, now)}, ${fmtSpan(prev.at, now)} ago`
+    : 'first report, no change (Δ) yet'
+  const lines = [`[CTM · ${fmtStamp(now)} · ${reason} · ${window}]`]
+
+  // Context
+  let ctx = `Context window: ${c.tokens === undefined ? '?' : fmtTokens(c.tokens)} of ${fmtTokens(c.window)} tokens used`
+  if (c.percent !== undefined) ctx += ` (${c.percent}%)`
+  if (c.tokens !== undefined && prev?.contextTokens != null) {
+    ctx += `, Δ ${fmtSigned(c.tokens - prev.contextTokens, fmtTokens)}`
+  }
+  if (threshold !== undefined) {
+    ctx += ` · auto-compact at ${fmtTokens(threshold)}`
+    if (c.tokens !== undefined) ctx += ` (${fmtTokens(Math.max(0, threshold - c.tokens))} left)`
+  }
+  lines.push(ctx)
+
+  // Compact threshold: a reminder past it; while unset, now and then a nudge to ask.
+  // Only the main agent can compact, so subagents get neither.
+  const notes: string[] = []
+  if (recipient === 'main') {
+    const setting = compactThresholdSetting()
+    const t = parseThreshold(setting)
+    if (t && c.tokens !== undefined && c.tokens >= thresholdTokens(t, c.window)) {
+      notes.push(
+        `Compact threshold passed (${fmtTokens(c.tokens)} ≥ ${fmtThreshold(t)}): if your task allows it, compact at the ` +
+          `next clean point (${T_RESET}) – a smaller context keeps the 5-hour and 7-day limits from growing needlessly. ` +
+          'Do not break off critical work for it.',
+      )
+    } else if (!t && setting !== 'off' && now - lastNagAt >= NAG_EVERY_MS) {
+      lastNagAt = now
+      notes.push(
+        `No compact threshold set. When it fits, ask the user whether to set one (e.g. 300k tokens or 30% of the window) ` +
+          `and save it with ${T_SETTINGS} – or compactThreshold "off" if they do not want one.`,
+      )
+    }
+  }
+
+  // Rate limits
+  const limits: Record<string, LimitReading> = {}
+  if (u.rateLimits.length > 0) {
+    for (const r of u.rateLimits) {
+      const reading = { percent: r.percentUsed, resetsAt: r.resetsAt ?? null }
+      limits[r.kind] = reading
+      const stale = readingIsStale(r, now)
+      let line = `${limitName(r.kind)}: ${fmtPercent(r.percentUsed)} used`
+      const d = prev ? limitDelta(prev.limits[r.kind], reading, now) : null
+      if (d) line += `, ${d}`
+      if (r.resetsAt) {
+        const at = Date.parse(r.resetsAt)
+        line += stale
+          ? ` · window reset ${fmtAt(at, now)} – this reading is from before, it is lower now`
+          : ` · resets ${fmtAt(at, now)} (in ${fmtSpan(now, at)})`
+      }
+      lines.push(line)
+
+      const kind = r.kind
+      if (isLimitKind(kind) && !stale) {
+        // The configured threshold when passed, else the built-in safety net.
+        const own = pauseAt(kind) > 0 && r.percentUsed >= pauseAt(kind)
+        const safety = !own && r.percentUsed >= FALLBACK_PAUSE_AT[kind]
+        if (own || safety) {
+          const mark = own ? pauseAt(kind) : FALLBACK_PAUSE_AT[kind]
+          const what = own
+            ? `your pause threshold ${fmtPercent(mark)}`
+            : `the built-in safety threshold ${fmtPercent(mark)} (always active, not configurable – a fallback on top ` +
+              'of any pause threshold you set)'
+          const w = watches.get(kind)
+          notes.push(
+            w
+              ? `${limitName(kind)} is past ${what}; wake-up armed for below ${fmtPercent(w.below)} – stay paused until then.`
+              : `${limitName(kind)} at ${fmtPercent(r.percentUsed)} ≥ ${what}: please pause your work at the next clean ` +
+                  `point – call ${T_WAKEUP} (limit "${kind}") and end your turn; you will be woken once it is back below` +
+                  `${r.resetsAt ? ` (the window resets ${fmtAt(Date.parse(r.resetsAt), now)})` : ''}.`,
+          )
+        }
+      }
+    }
+  } else {
+    lines.push('Rate limits: not reported (not signed in with a subscription, or no response yet)')
+  }
+  for (const w of watches.values()) {
+    if (!notes.some(n => n.startsWith(limitName(w.kind)))) {
+      notes.push(`Wake-up armed: ${limitName(w.kind)} below ${fmtPercent(w.below)}.`)
+    }
+  }
+  for (const n of notes) lines.push(`⚑ ${n}`)
+
+  if (idle) {
+    lines.push(
+      `Idle updates: on${idle.until === null ? '' : ` until ${fmtClock(idle.until, now)}`} ` +
+        `(turn off with ${T_IDLE} enabled=false)`,
+    )
+  }
+
+  previousReport.set(recipient, { at: now, contextTokens: c.tokens ?? null, limits })
+  return lines.join('\n')
+}
+
+// ---------------------------------------------------------------- Reset (runs after the turn)
+
+async function resetMessage($: EngineInterface, job: PendingReset, note: string): Promise<string> {
+  return [
+    note,
+    '',
+    INFO,
+    '',
+    '--- Your resume prompt ---',
+    job.resumePrompt,
+    '',
+    await report($, `after ${job.mode}`),
+  ].join('\n')
+}
+
+// Not every host offers every call: a headless session (-p, the SDK, cloud sessions)
+// refuses $.session.compact, and a slash command can only run through $.command.run
+// (never as a submitted prompt). So a compact the engine refuses falls back to the
+// /compact command, and a clear always runs as the /clear command. The resume prompt
+// goes out only once the engine confirms the reset – session.compact resolved, or
+// session.end with reason "clear" – otherwise the model is told the reset failed.
+
+// A host or hook can refuse an engine call by rejecting it or by answering { deny }.
+function refusedBy(result: unknown): void {
+  const deny = (result as { deny?: unknown } | null | undefined)?.deny
+  if (typeof deny === 'string') throw new Error(deny)
+}
+
+function errorText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err)
+}
+
+function finishReset($: EngineInterface, job: PendingReset, note: string): void {
+  awaiting = null
+  awaitTimer?.cancel()
+  awaitTimer = null
+  $.clock.after(RESET_DELAY_MS, () => void deliverResume($, job, note))
+}
+
+async function deliverResume($: EngineInterface, job: PendingReset, note: string): Promise<void> {
+  const now = await $.clock.now()
+  lastResetAt = now
+  lastSent.set('main', now)
+  await $.prompt.submit({ text: await resetMessage($, job, note) })
+}
+
+async function failReset($: EngineInterface, job: PendingReset, message: string): Promise<void> {
+  if (awaiting === job) awaiting = null
+  awaitTimer?.cancel()
+  awaitTimer = null
+  toast($, `CTM: ${job.mode} failed – ${message}`)
+  await $.prompt.submit({
+    text: `[CTM] The ${job.mode} you scheduled failed (${message}). The conversation is unchanged; carry on as usual.\n\n--- Your resume prompt ---\n${job.resumePrompt}`,
+  })
+}
+
+// Runs /compact or /clear as a command and waits for the engine's confirmation.
+async function runAsCommand($: EngineInterface, job: PendingReset): Promise<void> {
+  awaiting = job
+  awaitTimer?.cancel()
+  const timeout = job.mode === 'compact' ? COMPACT_CONFIRM_MS : CLEAR_CONFIRM_MS
+  awaitTimer = $.clock.after(timeout, () => {
+    if (awaiting === job) void failReset($, job, `no confirmation that /${job.mode} ran within ${fmtDuration(timeout)}`)
+  })
+  try {
+    refusedBy(await $.command.run({ command: job.mode, args: job.mode === 'compact' ? (job.instructions ?? '') : '' }))
+  } catch (err) {
+    if (awaiting === job) await failReset($, job, errorText(err))
+  }
+}
+
+async function runReset($: EngineInterface): Promise<void> {
+  const job = pending
+  if (!job) return
+  if (busy) return // a new turn is already running: try again at its turn.complete
+  pending = null
+
+  if (job.mode === 'clear') return runAsCommand($, job)
+
+  try {
+    const res = await $.session.compact({ instructions: job.instructions ?? undefined })
+    refusedBy(res)
+    if (res.skip) toast($, `CTM: compact refused – ${res.skip}`)
+    finishReset(
+      $,
+      job,
+      res.skip
+        ? `[CTM] The compact you scheduled was refused: ${res.skip}. The conversation is unchanged.`
+        : '[CTM] Your conversation was compacted as you scheduled.',
+    )
+  } catch {
+    await runAsCommand($, job) // e.g. headless: compaction runs as the /compact command there
+  }
+}
+
+// ---------------------------------------------------------------- Idle updates
+
+async function idleTick($: EngineInterface): Promise<void> {
+  if (!idle || busy || pending || awaiting) return
+  const now = await $.clock.now()
+  if (idle.until !== null && now >= idle.until) {
+    idle = null
+    toast($, 'CTM: idle updates expired')
+    return
+  }
+  const since = Math.max(lastSent.get('main') ?? 0, lastTurnEndAt)
+  if (now - since < intervalMs()) return
+  lastSent.set('main', now)
+  busy = true // until turn.start / turn.complete take over
+  await $.prompt.submit({ text: await report($, 'idle update') })
+}
+
+// ---------------------------------------------------------------- Limit wake-ups
+
+// Is the limit back below the watch's mark? A reading from before its window's reset
+// counts as below: no new reading comes while the model pauses.
+function watchMet(w: LimitWatch, r: { percentUsed: number; resetsAt?: string } | undefined, now: number): string | null {
+  if (!r) return null
+  if (readingIsStale(r, now)) return `its window reset ${fmtAt(Date.parse(r.resetsAt as string), now)}`
+  if (r.percentUsed < w.below) return `it is at ${fmtPercent(r.percentUsed)}`
+  return null
+}
+
+// Checks the armed wake-ups once per interval, and only while the model is idle: a
+// wake-up starts a turn.
+async function watchTick($: EngineInterface): Promise<void> {
+  if (watches.size === 0 || busy || pending || awaiting) return
+  const now = await $.clock.now()
+  if (now - lastWatchCheckAt < intervalMs()) return
+  lastWatchCheckAt = now
+  const u = await $.session.usage({ breakdown: 'summary' })
+  const met: string[] = []
+  const notes: string[] = []
+  for (const w of [...watches.values()]) {
+    const why = watchMet(w, u.rateLimits.find(r => r.kind === w.kind), now)
+    if (!why) continue
+    watches.delete(w.kind)
+    met.push(`the ${limitName(w.kind)} is below ${fmtPercent(w.below)} again (${why})`)
+    if (w.note) notes.push(w.note)
+  }
+  if (met.length === 0) return
+  lastSent.set('main', now)
+  busy = true // until turn.start / turn.complete take over
+  toast($, `CTM: limit wake-up – ${met.join('; ')}`)
+  const parts = [`[CTM] Limit wake-up: ${met.join('; ')}. You can carry on with your work.`]
+  if (notes.length > 0) parts.push('', '--- Your note ---', ...notes)
+  parts.push('', await report($, 'limit wake-up'))
+  await $.prompt.submit({ text: parts.join('\n') })
+}
+
+export const register: Register = (on, options) => {
+  configIntervalMinutes = clampInterval(Number(options.intervalMinutes ?? 3) || 3)
+  configCompactThreshold = String(options.compactThreshold ?? '').trim().toLowerCase()
+  const pct = (v: unknown) => Math.min(100, Math.max(0, Number(v ?? 0) || 0))
+  configPauseAt = { five_hour: pct(options.fiveHourPauseAt), seven_day: pct(options.sevenDayPauseAt) }
+  settings = null
+  lastNagAt = Number.NEGATIVE_INFINITY
+  lastWatchCheckAt = 0
+  watches.clear()
+  cooldownMs = Math.max(0, Number(options.resetCooldownMinutes ?? 10)) * MINUTE
+  attachToPrompts = options.attachToPrompts !== false
+  configuredTimeZone = String(options.timeZone ?? '')
+  timeZone = null
+
+  // ---------------------------------------------------------------- Session
+
+  on('session.start', async ($, e, next) => {
+    await $.tool.register({
+      name: 'status',
+      description:
+        'CTM: Returns the current CTM block – context window fill and auto-compact threshold, the 5-hour and ' +
+        '7-day rate limits with reset times, and how each changed since your previous CTM block.',
+      inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+      isDeferred: false,
+    })
+    await $.tool.register({
+      name: 'idle_updates',
+      description:
+        'CTM: Turns updates while you are idle on or off for this session. When on, you get the current ' +
+        `figures at the update interval (default ${configIntervalMinutes} min; see ${T_SETTINGS}) even when you are ` +
+        'doing nothing. ' +
+        'WARNING: every idle update starts a new turn and uses quota. Only turn it on while you are waiting ' +
+        'for something (e.g. a limit reset), and bound it with maxMinutes. While you work you get updates ' +
+        'on tool results anyway.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          enabled: { type: 'boolean' },
+          maxMinutes: { type: 'number', minimum: 1, description: 'Turns itself off after this. Omit = until turned off.' },
+        },
+        required: ['enabled'],
+        additionalProperties: false,
+      },
+      isDeferred: false,
+    })
+    await $.tool.register({
+      name: 'reset',
+      description:
+        'CTM: Schedules a compact or a clear of your conversation for the END of your current turn. Afterwards ' +
+        'you automatically receive resumePrompt as a new message and continue with it. Finish your answer ' +
+        'promptly after calling this.\n' +
+        '- mode "compact": the conversation is summarized. "instructions" (required) tells the summarizer ' +
+        'what it must keep.\n' +
+        '- mode "clear": the conversation is deleted COMPLETELY; only resumePrompt survives.\n' +
+        'The resumePrompt is the one thing you can rely on afterwards – a summary can lose details, a clear ' +
+        'loses everything. Write it so a fresh you can carry on from it alone, structured as:\n' +
+        '1. Next step: exactly what to continue with.\n' +
+        '2. Key facts: goal, current state, decisions taken and why, open items, relevant files, paths, ' +
+        'commands, IDs.\n' +
+        '3. Rules: every important rule, constraint and preference you were given (by the user, CLAUDE.md, ' +
+        'the task) – verbatim where the wording matters.\n' +
+        'There is NO length limit on resumePrompt or instructions: be complete rather than short. Either put ' +
+        'everything directly into the resumePrompt, or write the details to a file and give its exact path in ' +
+        'the resumePrompt (with the next step and a pointer to read the file first). ' +
+        `At least ${cooldownMs / MINUTE} minutes must pass between two resets. Main agent only.`,
+      inputSchema: {
+        type: 'object',
+        properties: {
+          mode: { type: 'string', enum: ['compact', 'clear'] },
+          instructions: {
+            type: 'string',
+            description:
+              'Required for compact, no length limit: what the summary must keep (goal, state, decisions, open ' +
+              'items, files, rules).',
+          },
+          resumePrompt: {
+            type: 'string',
+            description:
+              'Required, no length limit: the message you continue with after the reset – next step, key ' +
+              'facts, and every important rule; or the next step plus the exact path of a file holding them.',
+          },
+        },
+        required: ['mode', 'resumePrompt'],
+        additionalProperties: false,
+      },
+      isDeferred: false,
+    })
+    await $.tool.register({
+      name: 'settings',
+      description:
+        'CTM: Shows or changes the CTM settings (kept across sessions). Call without arguments to see them. ' +
+        'Change them when the user asks or agrees, or on your own judgement where the user left it to you. ' +
+        'null resets a setting to its default.\n' +
+        `- intervalMinutes (1–${MAX_INTERVAL_MINUTES}): how often CTM blocks come while you work and, with idle ` +
+        'updates on, while you are idle.\n' +
+        '- compactThreshold: context size from which the blocks remind you to compact when your task allows it – ' +
+        'tokens ("300k", 300000) or a percent of the window ("30%"); "off" = the user does not want one (stops ' +
+        'the reminders to ask).\n' +
+        '- fiveHourPauseAt / sevenDayPauseAt (percent, "off"): from this usage on, the blocks ask you to pause ' +
+        `and wait for the limit with ${T_WAKEUP}.`,
+      inputSchema: {
+        type: 'object',
+        properties: {
+          intervalMinutes: { type: ['number', 'null'], minimum: 1, maximum: MAX_INTERVAL_MINUTES },
+          compactThreshold: { type: ['string', 'number', 'null'], description: '"300k", 300000, "30%", "off" or null.' },
+          fiveHourPauseAt: { type: ['number', 'string', 'null'], description: 'Percent 1–100, "off" or null.' },
+          sevenDayPauseAt: { type: ['number', 'string', 'null'], description: 'Percent 1–100, "off" or null.' },
+        },
+        additionalProperties: false,
+      },
+      isDeferred: false,
+    })
+    await $.tool.register({
+      name: 'limit_wakeup',
+      description:
+        'CTM: Arms a wake-up for when a rate limit is back below a mark – after its window resets or once it ' +
+        'drops. CTM checks at the update interval while you are idle and then sends you a message, so you can ' +
+        'pause: call this, then end your turn. Use it when a block says a limit is past your pause threshold, ' +
+        'or on your own ("wake me when the 5-hour window has reset"). One wake-up per limit; arming again ' +
+        'replaces it, cancel=true removes it.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          limit: { type: 'string', enum: ['five_hour', 'seven_day'] },
+          belowPercent: {
+            type: 'number',
+            minimum: 1,
+            maximum: 100,
+            description:
+              'Wake when usage is below this. Default: the pause threshold of that limit, else the built-in ' +
+              'safety threshold (5-hour 95%, 7-day 97%).',
+          },
+          note: { type: 'string', description: 'Optional: what to continue with, sent back with the wake-up.' },
+          cancel: { type: 'boolean' },
+        },
+        required: ['limit'],
+        additionalProperties: false,
+      },
+      isDeferred: false,
+    })
+    await safe(() =>
+      $.command.register({
+        name: 'ctm',
+        description:
+          'CTM settings: /ctm shows them; /ctm interval 5 · /ctm compact 300k|30%|off|default · ' +
+          '/ctm pause5h 80|off|default · /ctm pause7d 90|off|default',
+      }),
+    )
+    await ensureSettings($)
+
+    idleTimer?.cancel()
+    // One after the other: a wake-up marks the model busy, so no idle update follows it at once.
+    idleTimer = $.clock.every(IDLE_TICK_MS, () => void watchTick($).then(() => idleTick($)))
+    return next(e)
+  })
+
+  // /ctm – the person's own way to see and change the settings.
+  on('command.run', { command: 'ctm' }, async ($, e) => {
+    const [what = '', raw = ''] = e.args.trim().toLowerCase().split(/\s+/)
+    const value = raw === 'default' ? null : raw
+    const key = { interval: 'intervalMinutes', compact: 'compactThreshold', pause5h: 'fiveHourPauseAt', pause7d: 'sevenDayPauseAt' }[
+      what
+    ]
+    if (what && (!key || raw === '')) {
+      return { text: 'Usage: /ctm · /ctm interval 5 · /ctm compact 300k|30%|off|default · /ctm pause5h 80|off|default · /ctm pause7d 90|off|default' }
+    }
+    if (key) {
+      const err = await changeSettings($, { [key]: value })
+      if (err) return { text: `CTM: ${err}` }
+    } else await ensureSettings($)
+    if (!key) return { text: describeSettings() }
+    const answer = await settingsAnswer($, true)
+    lastSent.set('main', await $.clock.now())
+    return { text: answer, context: [`The user changed the CTM settings with /ctm.\n${answer}`] }
+  })
+
+  on('session.end', async ($, e, next) => {
+    // /clear only ends the session formally; timer and state stay.
+    if (e.reason !== 'clear') {
+      idleTimer?.cancel()
+      idleTimer = null
+    }
+    const r = await next(e)
+    const job = awaiting
+    if (e.reason === 'clear' && job?.mode === 'clear') {
+      finishReset($, job, '[CTM] Your conversation was cleared completely as you scheduled.')
+    }
+    return r
+  })
+
+  // Confirms a /compact that CTM submitted as a prompt (headless hosts).
+  on('session.compact', async ($, e, next) => {
+    const r = await next(e)
+    const job = awaiting
+    if (job?.mode === 'compact' && e.trigger !== 'precompute' && !e.agentId) {
+      finishReset(
+        $,
+        job,
+        r.skip
+          ? `[CTM] The compact you scheduled was refused: ${r.skip}. The conversation is unchanged.`
+          : '[CTM] Your conversation was compacted as you scheduled.',
+      )
+    }
+    return r
+  })
+
+  // Permanent briefing in the system prompt: there from the start, survives compact and clear.
+  on('prompt.compose', async ($, e, next) => {
+    const r = await next(e)
+    return { sections: [...r.sections, { id: 'ctm:info', text: INFO, scope: 'session' as const }] }
+  }).catch(($, e, next) => next(e))
+
+  // ---------------------------------------------------------------- Turns
+
+  on('turn.start', async ($, e, next) => {
+    busy = true
+    return next(e)
+  })
+
+  on('turn.complete', async ($, e, next) => {
+    const r = await next(e)
+    if (e.agentId) return r // a subagent's run does not end a turn of the main agent
+    busy = false
+    lastTurnEndAt = await $.clock.now()
+    if (pending) {
+      if (e.isAborted) {
+        // Interrupted: the person is stepping in, so nothing fires on its own.
+        toast($, `CTM: scheduled ${pending.mode} dropped (turn interrupted)`)
+        pending = null
+      } else {
+        $.clock.after(RESET_DELAY_MS, () => void runReset($))
+      }
+    }
+    return r
+  })
+
+  // ---------------------------------------------------------------- The model's tools
+
+  on('tool.call', { tool: T_STATUS }, async ($, e) => {
+    const recipient = e.agentId ?? 'main'
+    lastSent.set(recipient, await $.clock.now())
+    return { result: await report($, 'status request', recipient) }
+  }).catch(() => ({ deny: 'CTM: could not read the current figures.' }))
+
+  on('tool.call', { tool: T_IDLE }, async ($, e) => {
+    const input = e as unknown as { enabled?: unknown; maxMinutes?: unknown }
+    if (typeof input.enabled !== 'boolean') return { deny: 'CTM: "enabled" (true/false) is missing.' }
+    if (!input.enabled) {
+      idle = null
+      return { result: 'CTM: idle updates OFF.' }
+    }
+    const max = typeof input.maxMinutes === 'number' && input.maxMinutes > 0 ? input.maxMinutes : null
+    const now = await $.clock.now()
+    idle = { until: max === null ? null : now + max * MINUTE }
+    toast($, `CTM: idle updates on${max === null ? '' : ` for ${max} min`}`)
+    return {
+      result:
+        `CTM: idle updates ON${max === null ? ' until turned off' : ` for ${max} min`}. ` +
+        `Next update within ${intervalMinutes()} min, unless you are working then.`,
+    }
+  }).catch(() => ({ deny: 'CTM: could not switch idle updates.' }))
+
+  on('tool.call', { tool: T_RESET }, async ($, e) => {
+    if (e.agentId) return { deny: 'CTM: only the main agent may compact or clear.' }
+    const input = e as unknown as { mode?: unknown; instructions?: unknown; resumePrompt?: unknown }
+    const mode = input.mode
+    if (mode !== 'compact' && mode !== 'clear') return { deny: 'CTM: "mode" must be "compact" or "clear".' }
+    const resumePrompt = typeof input.resumePrompt === 'string' ? input.resumePrompt.trim() : ''
+    if (resumePrompt.length < MIN_RESUME_CHARS) {
+      return { deny: `CTM: no ${mode} without a meaningful resumePrompt (at least ${MIN_RESUME_CHARS} characters).` }
+    }
+    const instructions = typeof input.instructions === 'string' ? input.instructions.trim() : ''
+    if (mode === 'compact' && instructions.length < MIN_INSTRUCTION_CHARS) {
+      return {
+        deny: `CTM: compact needs "instructions" (at least ${MIN_INSTRUCTION_CHARS} characters): what the summary must keep.`,
+      }
+    }
+    const now = await $.clock.now()
+    const wait = lastResetAt + cooldownMs - now
+    if (wait > 0) return { deny: `CTM: the last reset was too recent. Next one possible ${fmtIn(wait)}.` }
+
+    const replaced = pending !== null
+    pending = { mode, instructions: mode === 'compact' ? instructions : null, resumePrompt }
+    toast($, `CTM: the model scheduled a ${mode} for the end of this turn`)
+    return {
+      result:
+        `CTM: ${mode} scheduled for the end of this turn${replaced ? ' (replaces the reset scheduled before)' : ''}. ` +
+        'Finish your answer now; you will then receive your resume prompt.',
+    }
+  }).catch(() => ({ deny: 'CTM: could not schedule the reset.' }))
+
+  on('tool.call', { tool: T_SETTINGS }, async ($, e) => {
+    const input = e as unknown as SettingsChange
+    const change: SettingsChange = {}
+    for (const k of ['intervalMinutes', 'compactThreshold', 'fiveHourPauseAt', 'sevenDayPauseAt'] as const) {
+      if (k in input) change[k] = input[k]
+    }
+    const changed = Object.keys(change).length > 0
+    if (changed) {
+      const err = await changeSettings($, change)
+      if (err) return { deny: `CTM: ${err}` }
+      toast($, 'CTM: settings changed by the model')
+    } else await ensureSettings($)
+    lastSent.set(e.agentId ?? 'main', await $.clock.now())
+    return { result: await settingsAnswer($, changed) }
+  }).catch(() => ({ deny: 'CTM: could not read or save the settings.' }))
+
+  on('tool.call', { tool: T_WAKEUP }, async ($, e) => {
+    if (e.agentId) return { deny: 'CTM: only the main agent can arm a limit wake-up.' }
+    const input = e as unknown as { limit?: unknown; belowPercent?: unknown; note?: unknown; cancel?: unknown }
+    const kind = input.limit
+    if (!isLimitKind(kind)) return { deny: 'CTM: "limit" must be "five_hour" or "seven_day".' }
+    if (input.cancel === true) {
+      const had = watches.delete(kind)
+      return { result: `CTM: ${had ? 'wake-up removed' : 'no wake-up was armed'} for the ${limitName(kind)}.` }
+    }
+    await ensureSettings($)
+    const below =
+      typeof input.belowPercent === 'number' ? input.belowPercent : pauseAt(kind) > 0 ? pauseAt(kind) : FALLBACK_PAUSE_AT[kind]
+    if (!(below > 0 && below <= 100)) return { deny: 'CTM: belowPercent must be from 1 to 100.' }
+    const watch: LimitWatch = { kind, below, note: typeof input.note === 'string' ? input.note.trim() : '' }
+    const now = await $.clock.now()
+    const u = await $.session.usage({ breakdown: 'summary' })
+    const r = u.rateLimits.find(x => x.kind === kind)
+    if (!r) return { deny: `CTM: no reading for the ${limitName(kind)} (not on a subscription, or no response yet).` }
+    const already = watchMet(watch, r, now)
+    if (already) return { result: `CTM: no need to wait – the ${limitName(kind)} is below ${fmtPercent(below)} already (${already}).` }
+    watches.set(kind, watch)
+    lastWatchCheckAt = now
+    toast($, `CTM: wake-up armed – ${limitName(kind)} below ${fmtPercent(below)}`)
+    return {
+      result:
+        `CTM: wake-up armed for the ${limitName(kind)} below ${fmtPercent(below)} (now ${fmtPercent(r.percentUsed)}` +
+        `${r.resetsAt ? `, window resets ${fmtAt(Date.parse(r.resetsAt), now)}` : ''}). CTM checks every ` +
+        `${intervalMinutes()} min while you are idle. End your turn now; you will get a message when it is time ` +
+        'to carry on.',
+    }
+  }).catch(() => ({ deny: 'CTM: could not arm the wake-up.' }))
+
+  // ---------------------------------------------------------------- Figures while working
+
+  on('tool.call', async ($, e, next) => {
+    const r = await next(e)
+    if (r.deny !== undefined || String(e.tool).startsWith(PREFIX)) return r
+    const recipient = e.agentId ?? 'main'
+    const now = await $.clock.now()
+    if (now - (lastSent.get(recipient) ?? 0) < intervalMs()) return r
+    lastSent.set(recipient, now)
+    return { ...r, context: [...(r.context ?? []), await report($, 'work update', recipient)] }
+  }).catch(($, e, next) => next(e))
+
+  // ---------------------------------------------------------------- The person's prompts
+
+  on('prompt.submit', async ($, e, next) => {
+    if (!attachToPrompts) return next(e)
+    if (e.origin?.kind === 'plugin') return next(e) // our own wake-up and resume prompts carry the figures already
+    lastSent.set('main', await $.clock.now())
+    return next({ ...e, context: [...(e.context ?? []), await report($, 'prompt')] })
+  }).catch(($, e, next) => next(e))
+}

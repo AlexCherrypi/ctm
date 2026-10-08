@@ -1,0 +1,685 @@
+import { describe, expect, mock, test } from 'claude-code/testing'
+import type { Engine } from 'claude-code/testing'
+import type { On } from 'claude-code'
+
+type Usage = {
+  context: { tokens?: number; window: number; percent?: number }
+  rateLimits: { kind: string; percentUsed: number; resetsAt?: string }[]
+}
+
+const USAGE: Usage = {
+  context: { tokens: 84_000, window: 200_000, percent: 42 },
+  rateLimits: [
+    { kind: 'five_hour', percentUsed: 23.5, resetsAt: '2026-10-08T17:00:00.000Z' },
+    { kind: 'seven_day', percentUsed: 41.2, resetsAt: '2026-10-12T09:00:00.000Z' },
+  ],
+}
+
+// The world beneath the plugin: figures, compact, clear, queued prompts. Swap
+// `usage.current` mid-test to make the figures move.
+function world(on: On, initial: Usage = USAGE, opts: { headless?: boolean } = {}) {
+  const usage = { current: initial }
+  const seen = {
+    compacts: [] as (string | undefined)[],
+    commands: [] as string[],
+    prompts: [] as string[],
+    tools: [] as { name: string; description: string }[],
+    usage,
+  }
+  on('session.usage', () => ({ value: usage.current }) as never)
+  // Headless: the plugin's own first $.session.compact is refused, as such a host does.
+  let refuseCompacts = opts.headless ? 1 : 0
+  on('session.compact', (_$, e) => {
+    if (refuseCompacts > 0) {
+      refuseCompacts -= 1
+      throw new Error('$.session.compact: not available in a headless (-p / SDK) session yet')
+    }
+    seen.compacts.push(e.instructions)
+    return { messages: [{ role: 'user', text: 'summary', toolUses: [] }] } as never
+  })
+  on('command.run', (_$, e) => {
+    seen.commands.push(e.args ? `${e.command} ${e.args}` : e.command)
+    return { text: '' }
+  })
+  on('prompt.submit', (_$, e) => {
+    seen.prompts.push(e.text)
+    return { text: e.text, context: e.context }
+  })
+  on('session.end', (_$, e) => ({ sessionId: e.sessionId }) as never)
+  on('ui.toast', () => ({ value: undefined }) as never)
+  on('tool.register', (_$, e) => {
+    seen.tools.push({ name: e.name, description: e.description })
+    return { value: { tool: `mcp__ctm__${e.name}` } } as never
+  })
+  return seen
+}
+
+const RESUME = 'Next step: continue with step 3 of the migration. Rules: never push to main.'
+const INSTRUCTIONS = 'Keep the goal, the migration status and the open TODOs.'
+
+const turn = { answer: '', durationMs: 1, isAborted: false, turnId: 't1', reason: 'answer' } as never
+
+async function status($: Engine, agentId?: string): Promise<string> {
+  return String((await $.tool.call({ tool: 'mcp__ctm__status', ...(agentId ? { agentId } : {}) } as never)).result)
+}
+
+describe('reset', () => {
+  test('refuses a clear without a resume prompt', async ($, on) => {
+    world(on)
+    const r = await $.tool.call({ tool: 'mcp__ctm__reset', mode: 'clear' } as never)
+    expect(r.deny).toMatch(/resumePrompt/)
+  })
+
+  test('refuses a compact without instructions', async ($, on) => {
+    world(on)
+    const r = await $.tool.call({ tool: 'mcp__ctm__reset', mode: 'compact', resumePrompt: RESUME } as never)
+    expect(r.deny).toMatch(/instructions/)
+  })
+
+  test('refuses subagents', async ($, on) => {
+    world(on)
+    const r = await $.tool.call({
+      tool: 'mcp__ctm__reset',
+      mode: 'clear',
+      resumePrompt: RESUME,
+      agentId: 'sub-1',
+    } as never)
+    expect(r.deny).toMatch(/main agent/)
+  })
+
+  test('compacts after the turn and sends the resume prompt', async ($, on) => {
+    const seen = world(on)
+    const clock = mock.clock(on, { now: 1_000_000 })
+    on('turn.complete', () => ({ text: '' }) as never)
+
+    const r = await $.tool.call({
+      tool: 'mcp__ctm__reset',
+      mode: 'compact',
+      instructions: INSTRUCTIONS,
+      resumePrompt: RESUME,
+    } as never)
+    expect(r.deny).toBeUndefined()
+    expect(seen.compacts).toEqual([])
+
+    await $.turn.complete(turn)
+    await clock.advance(2_000)
+
+    expect(seen.compacts).toEqual([INSTRUCTIONS])
+    expect(seen.prompts.length).toBe(1)
+    expect(seen.prompts[0]).toContain(RESUME)
+    expect(seen.prompts[0]).toContain('[CTM] Your conversation was compacted')
+    expect(seen.prompts[0]).toContain('5-hour limit: 23.5% used · resets ')
+  })
+
+  test('clears through /clear and then enforces the cooldown', async ($, on) => {
+    const seen = world(on)
+    const clock = mock.clock(on, { now: 1_000_000 })
+    on('turn.complete', () => ({ text: '' }) as never)
+
+    await $.tool.call({ tool: 'mcp__ctm__reset', mode: 'clear', resumePrompt: RESUME } as never)
+    await $.turn.complete(turn)
+    await clock.advance(1_000)
+    expect(seen.commands).toEqual(['clear'])
+    expect(seen.prompts).toEqual([]) // not before the engine confirms the clear
+
+    await $.session.end({ reason: 'clear', sessionId: 's1', resume: { id: 's1' } } as never)
+    await clock.advance(1_000)
+    expect(seen.prompts[0]).toContain('[CTM] Your conversation was cleared completely as you scheduled.')
+    expect(seen.prompts[0]).toContain(RESUME)
+
+    const again = await $.tool.call({ tool: 'mcp__ctm__reset', mode: 'clear', resumePrompt: RESUME } as never)
+    expect(again.deny).toMatch(/too recent/)
+  })
+
+  test('has no length limit on resume prompt or instructions', async ($, on) => {
+    const seen = world(on)
+    const clock = mock.clock(on, { now: 1_000_000 })
+    on('turn.complete', () => ({ text: '' }) as never)
+    const long = `Next step: go on.\n${'Key fact. '.repeat(20_000)}`
+    const r = await $.tool.call({
+      tool: 'mcp__ctm__reset',
+      mode: 'compact',
+      instructions: long,
+      resumePrompt: long,
+    } as never)
+    expect(r.deny).toBeUndefined()
+    await $.turn.complete(turn)
+    await clock.advance(2_000)
+    expect(seen.compacts[0]?.length).toBe(long.trim().length)
+    expect(seen.prompts[0]).toContain(long.trim())
+  })
+
+  test('the reset tool tells the model there is no length limit and how to structure the prompt', async ($, on) => {
+    const seen = world(on)
+    on('session.start', () => ({ cwd: '/' }) as never)
+    mock.clock(on, { now: 0 })
+    await $.session.start({ cwd: '/' } as never)
+    const reset = seen.tools.find(t => t.name === 'reset')
+    expect(reset?.description).toContain('NO length limit')
+    expect(reset?.description).toMatch(/Next step[\s\S]*Key facts[\s\S]*Rules/)
+    expect(reset?.description).toMatch(/write the details to a file and give its exact path/)
+  })
+
+  test('an interrupted turn drops the scheduled reset', async ($, on) => {
+    const seen = world(on)
+    const clock = mock.clock(on, { now: 1_000_000 })
+    on('turn.complete', () => ({ text: '' }) as never)
+
+    await $.tool.call({ tool: 'mcp__ctm__reset', mode: 'clear', resumePrompt: RESUME } as never)
+    await $.turn.complete({ ...(turn as object), isAborted: true, reason: 'aborted' } as never)
+    await clock.advance(5_000)
+    expect(seen.commands).toEqual([])
+    expect(seen.prompts).toEqual([])
+  })
+})
+
+describe('reset in a headless host', () => {
+  test('compact falls back to the /compact command and resumes once it ran', async ($, on) => {
+    const seen = world(on, USAGE, { headless: true })
+    const clock = mock.clock(on, { now: 1_000_000 })
+    on('turn.complete', () => ({ text: '' }) as never)
+
+    await $.tool.call({
+      tool: 'mcp__ctm__reset',
+      mode: 'compact',
+      instructions: INSTRUCTIONS,
+      resumePrompt: RESUME,
+    } as never)
+    await $.turn.complete(turn)
+    await clock.advance(1_000)
+    expect(seen.commands).toEqual([`compact ${INSTRUCTIONS}`])
+    expect(seen.prompts).toEqual([])
+
+    // The engine runs that /compact.
+    await $.session.compact({
+      trigger: 'manual',
+      instructions: INSTRUCTIONS,
+      messages: [{ role: 'user', text: 'hi', toolUses: [] }],
+    } as never)
+    await clock.advance(1_000)
+    expect(seen.prompts.length).toBe(1)
+    expect(seen.prompts[0]).toContain('[CTM] Your conversation was compacted as you scheduled.')
+    expect(seen.prompts[0]).toContain(RESUME)
+  })
+
+  test('without confirmation it reports the failure', async ($, on) => {
+    const seen = world(on)
+    const clock = mock.clock(on, { now: 1_000_000 })
+    on('turn.complete', () => ({ text: '' }) as never)
+
+    await $.tool.call({ tool: 'mcp__ctm__reset', mode: 'clear', resumePrompt: RESUME } as never)
+    await $.turn.complete(turn)
+    await clock.advance(1_000)
+    expect(seen.commands).toEqual(['clear'])
+    await clock.advance(2 * 60_000)
+    expect(seen.prompts.length).toBe(1)
+    expect(seen.prompts[0]).toContain('[CTM] The clear you scheduled failed (no confirmation that /clear ran within 2 min)')
+    expect(seen.prompts[0]).toContain(RESUME)
+  })
+})
+
+describe('figures', () => {
+  test('attaches to tool results at most every 3 minutes', async ($, on) => {
+    world(on)
+    const clock = mock.clock(on, { now: 10 * 60_000 })
+    on('tool.call', { tool: 'Read' }, () => ({ result: 'content' }) as never)
+
+    const first = await $.tool.call({ tool: 'Read', file_path: '/a' } as never)
+    expect(first.context?.join('\n')).toContain('Context window: 84k of 200k tokens used (42%)')
+
+    const second = await $.tool.call({ tool: 'Read', file_path: '/a' } as never)
+    expect(second.context).toBeUndefined()
+
+    await clock.advance(3 * 60_000)
+    const third = await $.tool.call({ tool: 'Read', file_path: '/a' } as never)
+    expect(third.context?.join('\n')).toContain('[CTM')
+  })
+
+  test('status returns the figures', async ($, on) => {
+    world(on)
+    mock.clock(on, { now: 0 })
+    const r = await status($)
+    expect(r).toContain('7-day limit: 41.2% used · resets')
+    expect(r).not.toContain('cost')
+  })
+
+  test('attaches the figures to the person’s prompts', async ($, on) => {
+    world(on)
+    mock.clock(on, { now: 0 })
+    const r = await $.prompt.submit({ text: 'go on' } as never)
+    expect(r.context?.join('\n')).toContain('Context window: 84k of 200k')
+  })
+
+  test('idle updates wake the model only when turned on', async ($, on) => {
+    const seen = world(on)
+    const clock = mock.clock(on, { now: 10 * 60_000 })
+    on('session.start', () => ({ cwd: '/' }) as never)
+    await $.session.start({ cwd: '/' } as never)
+
+    await clock.advance(10 * 60_000)
+    expect(seen.prompts).toEqual([])
+
+    await $.tool.call({ tool: 'mcp__ctm__idle_updates', enabled: true, maxMinutes: 30 } as never)
+    await clock.advance(3 * 60_000)
+    expect(seen.prompts.length).toBe(1)
+    expect(seen.prompts[0]).toContain('idle update')
+
+    await $.tool.call({ tool: 'mcp__ctm__idle_updates', enabled: false } as never)
+    await clock.advance(10 * 60_000)
+    expect(seen.prompts.length).toBe(1)
+  })
+})
+
+describe('deltas', () => {
+  test('the first report says there is no change yet', async ($, on) => {
+    world(on)
+    mock.clock(on, { now: 0 })
+    const r = await status($)
+    expect(r).toContain('· first report, no change (Δ) yet]')
+    expect(r).not.toContain(', Δ')
+  })
+
+  test('names the window once and puts one delta on each figure', async ($, on) => {
+    const seen = world(on)
+    const clock = mock.clock(on, { now: Date.parse('2026-10-08T06:00:00.000Z') })
+    await status($)
+
+    await clock.advance(50 * 60_000)
+    seen.usage.current = {
+      context: { tokens: 96_000, window: 200_000, percent: 48 },
+      rateLimits: [
+        { kind: 'five_hour', percentUsed: 28.5, resetsAt: '2026-10-08T17:00:00.000Z' },
+        { kind: 'seven_day', percentUsed: 42.2, resetsAt: '2026-10-12T09:00:00.000Z' },
+      ],
+    }
+    const r = await status($)
+    expect(r).toMatch(/· status request · Δ = change since previous report at \d\d:00, 50 min ago\]/)
+    expect(r).toContain('\nContext window: 96k of 200k tokens used (48%), Δ +12k\n')
+    expect(r).toMatch(/\n5-hour limit: 28\.5% used, Δ \+5 pts · resets at \d\d:00 \(in 10 h 10 min\)\n/)
+    expect(r).toMatch(/\n7-day limit: 42\.2% used, Δ \+1 pt · resets Mon 10-12 at \d\d:00 \(in 4 d 2 h\)/)
+  })
+
+  test('measures only from report to report', async ($, on) => {
+    const seen = world(on)
+    const clock = mock.clock(on, { now: Date.parse('2026-10-08T06:00:00.000Z') })
+    await status($)
+    await clock.advance(10 * 60_000)
+    seen.usage.current = {
+      ...USAGE,
+      rateLimits: [{ kind: 'five_hour', percentUsed: 25.5, resetsAt: '2026-10-08T17:00:00.000Z' }],
+    }
+    await status($)
+    await clock.advance(10 * 60_000)
+    seen.usage.current = {
+      ...USAGE,
+      rateLimits: [{ kind: 'five_hour', percentUsed: 30, resetsAt: '2026-10-08T17:00:00.000Z' }],
+    }
+    const r = await status($)
+    expect(r).toMatch(/previous report at \d\d:10, 10 min ago\]/)
+    expect(r).toContain('5-hour limit: 30% used, Δ +4.5 pts')
+  })
+
+  test('the span matches the shown clock times, not the raw seconds', async ($, on) => {
+    world(on)
+    const clock = mock.clock(on, { now: Date.parse('2026-10-08T06:42:59.000Z') })
+    await status($)
+    await clock.advance(3 * 60_000 + 31_000) // 06:46:30: 3.5 min of real time
+    const r = await status($)
+    expect(r).toMatch(/\d\d:46 .*previous report at \d\d:42, 4 min ago\]/)
+    await clock.advance(29_000) // 06:46:59, same shown minute
+    expect(await status($)).toMatch(/previous report at \d\d:46, <1 min ago\]/)
+  })
+
+  test('the time until a reset matches the shown clock times', async ($, on) => {
+    const seen = world(on)
+    seen.usage.current = {
+      ...USAGE,
+      rateLimits: [{ kind: 'five_hour', percentUsed: 12, resetsAt: '2026-10-08T11:00:00.000Z' }],
+    }
+    mock.clock(on, { now: Date.parse('2026-10-08T06:47:50.000Z') })
+    expect(await status($)).toContain('(in 4 h 13 min)')
+  })
+
+  test('names a window reset instead of subtracting across it', async ($, on) => {
+    const seen = world(on)
+    const clock = mock.clock(on, { now: Date.parse('2026-10-08T16:30:00.000Z') })
+    await status($)
+    await clock.advance(60 * 60_000)
+    seen.usage.current = {
+      ...USAGE,
+      rateLimits: [{ kind: 'five_hour', percentUsed: 3, resetsAt: '2026-10-08T22:00:00.000Z' }],
+    }
+    expect(await status($)).toMatch(
+      /5-hour limit: 3% used, Δ window reset at \d\d:00 \(was 23\.5%\) · resets at \d\d:00 \(in 4 h 30 min\)/,
+    )
+  })
+
+  test('tracks each recipient separately', async ($, on) => {
+    world(on)
+    mock.clock(on, { now: 0 })
+    await status($)
+    expect(await status($)).toContain('· Δ = change since previous report')
+    expect(await status($, 'sub-1')).toContain('first report, no change (Δ) yet')
+  })
+
+  test('no token totals and no cost in the block', async ($, on) => {
+    world(on)
+    mock.clock(on, { now: 0 })
+    const r = await status($)
+    expect(r.split('\n').filter(l => !l.startsWith('⚑')).length).toBe(4)
+    expect(r).not.toMatch(/cache|cost|turns/i)
+  })
+})
+
+describe('time', () => {
+  test('the time zone is named once, in the header', { options: { timeZone: 'Europe/Berlin' } }, async ($, on) => {
+    world(on)
+    mock.clock(on, { now: Date.parse('2026-10-08T06:00:00.000Z') })
+    const r = await status($)
+    expect(r).toContain('[CTM · Thu 2026-10-08 08:00 Europe/Berlin (UTC+02:00) · status request ·')
+    expect(r).toContain('5-hour limit: 23.5% used · resets at 19:00 (in 11 h 0 min)')
+    expect(r).toContain('7-day limit: 41.2% used · resets Mon 10-12 at 11:00 (in 4 d 3 h)')
+    expect(r.match(/Europe\/Berlin/g)?.length).toBe(1)
+  })
+
+  test('a time with another offset (DST) names its offset', { options: { timeZone: 'Europe/Berlin' } }, async ($, on) => {
+    const seen = world(on)
+    seen.usage.current = {
+      ...USAGE,
+      rateLimits: [{ kind: 'seven_day', percentUsed: 41.2, resetsAt: '2026-10-26T09:00:00.000Z' }],
+    }
+    mock.clock(on, { now: Date.parse('2026-10-22T06:00:00.000Z') })
+    expect(await status($)).toContain('7-day limit: 41.2% used · resets Mon 10-26 at 10:00 (UTC+01:00) (in 4 d 3 h)')
+  })
+
+  test('without a setting, the system zone or UTC – always named', async ($, on) => {
+    world(on)
+    mock.clock(on, { now: Date.parse('2026-10-08T06:00:00.000Z') })
+    expect(await status($)).toMatch(/^\[CTM · (Wed|Thu) 2026-10-0[78] \d\d:\d\d [A-Za-z_/+-]+ \(UTC[+-]\d\d:\d\d\)/)
+  })
+
+  test('takes the zone from TZ when nothing is configured', async ($, on) => {
+    world(on)
+    on('env.get', (_$, e) => ({ value: e.name === 'TZ' ? ':America/New_York' : undefined }) as never)
+    mock.clock(on, { now: Date.parse('2026-10-08T06:00:00.000Z') })
+    const r = await status($)
+    expect(r).toContain('[CTM · Thu 2026-10-08 02:00 America/New_York (UTC-04:00)')
+    expect(r).toContain('5-hour limit: 23.5% used · resets at 13:00 (in 11 h 0 min)')
+  })
+
+  test('takes the zone from /etc/localtime when TZ is unset', async ($, on) => {
+    world(on)
+    on('env.get', () => ({ value: undefined }) as never)
+    on(
+      'fs.stat',
+      () =>
+        ({
+          value: { kind: 'file', size: 1, mtimeMs: 0, isLink: true, realPath: '/usr/share/zoneinfo/Asia/Tokyo' },
+        }) as never,
+    )
+    mock.clock(on, { now: Date.parse('2026-10-08T06:00:00.000Z') })
+    expect(await status($)).toContain('[CTM · Thu 2026-10-08 15:00 Asia/Tokyo (UTC+09:00)')
+  })
+})
+
+test('the CTM briefing is in the system prompt', async ($, on) => {
+  on('prompt.compose', () => ({ sections: [{ id: 'intro', text: 'You are Claude.', scope: 'shared' }] }) as never)
+  const r = await $.prompt.compose({
+    model: 'm',
+    promptModel: 'm',
+    surfaces: [],
+    tools: [],
+    outputStyle: null,
+    traits: [],
+  } as never)
+  const ctm = r.sections.find(s => s.id === 'ctm:info')
+  expect(ctm?.scope).toBe('session')
+  expect(ctm?.text).toContain('mcp__ctm__reset')
+  expect(ctm?.text).toContain('account-wide')
+  expect(ctm?.text).not.toMatch(/first report|cache read|session cost/i)
+})
+
+describe('settings', () => {
+  test('the model changes the interval; work updates follow it', async ($, on) => {
+    world(on)
+    mock.store(on)
+    const clock = mock.clock(on, { now: 10 * 60_000 })
+    on('tool.call', { tool: 'Bash' }, () => ({ result: 'ok' }) as never)
+    const set = await $.tool.call({ tool: 'mcp__ctm__settings', intervalMinutes: 10 } as never)
+    expect(String(set.result)).toContain('intervalMinutes: 10')
+    expect(String(set.result)).toContain('[CTM') // the answer carries a block itself
+    await clock.advance(5 * 60_000)
+    const second = await $.tool.call({ tool: 'Bash', command: 'ls' } as never)
+    expect(second.context ?? []).toHaveLength(0)
+    await clock.advance(5 * 60_000)
+    const third = await $.tool.call({ tool: 'Bash', command: 'ls' } as never)
+    expect(third.context?.join('')).toContain('[CTM')
+    await clock.advance(5 * 60_000)
+    const fourth = await $.tool.call({ tool: 'Bash', command: 'ls' } as never)
+    expect(fourth.context ?? []).toHaveLength(0)
+  })
+
+  test('settings are kept in the store and shown without arguments', async ($, on) => {
+    world(on)
+    mock.store(on, { settings: { compactThreshold: '300k', pauseAt: { five_hour: 80 } } })
+    mock.clock(on, { now: 0 })
+    const r = String((await $.tool.call({ tool: 'mcp__ctm__settings' } as never)).result)
+    expect(r).toContain('compactThreshold: 300k')
+    expect(r).toContain('fiveHourPauseAt: 80%')
+    expect(r).toContain('sevenDayPauseAt: off')
+  })
+
+  test('rejects nonsense', async ($, on) => {
+    world(on)
+    mock.store(on)
+    mock.clock(on, { now: 0 })
+    const r = await $.tool.call({ tool: 'mcp__ctm__settings', compactThreshold: 'lots' } as never)
+    expect(r.deny).toMatch(/compactThreshold/)
+  })
+
+  test('/ctm lets the person change them', async ($, on) => {
+    world(on)
+    mock.store(on)
+    mock.clock(on, { now: 0 })
+    const r = await $.command.run({ command: 'ctm', args: 'compact 30%' } as never)
+    expect(r.text).toContain('compactThreshold: 30%')
+    const shown = await $.command.run({ command: 'ctm', args: '' } as never)
+    expect(shown.text).toContain('compactThreshold: 30%')
+  })
+})
+
+describe('compact threshold', () => {
+  test('unset: the block now and then nudges to ask the user', async ($, on) => {
+    world(on)
+    mock.store(on)
+    const clock = mock.clock(on, { now: 0 })
+    expect(await status($)).toMatch(/No compact threshold set.*ask the user/)
+    await clock.advance(10 * 60_000)
+    expect(await status($)).not.toMatch(/No compact threshold/)
+    await clock.advance(25 * 60_000)
+    expect(await status($)).toMatch(/No compact threshold set/)
+  })
+
+  test('"off" stops the nudging', async ($, on) => {
+    world(on)
+    mock.store(on, { settings: { compactThreshold: 'off' } })
+    mock.clock(on, { now: 0 })
+    expect(await status($)).not.toMatch(/compact threshold/i)
+  })
+
+  test('past the threshold the block reminds to compact if the task allows', async ($, on) => {
+    world(on) // 84k of 200k
+    mock.store(on, { settings: { compactThreshold: '80k' } })
+    mock.clock(on, { now: 0 })
+    expect(await status($)).toMatch(/Compact threshold passed \(84k ≥ 80k\): if your task allows it/)
+  })
+
+  test('a percent threshold is measured against the window', async ($, on) => {
+    world(on) // 84k of 200k = 42%
+    mock.store(on, { settings: { compactThreshold: '50%' } })
+    mock.clock(on, { now: 0 })
+    expect(await status($)).not.toMatch(/compact threshold/i)
+  })
+
+  test('subagents get no compact reminders', async ($, on) => {
+    world(on)
+    mock.store(on, { settings: { compactThreshold: '80k' } })
+    mock.clock(on, { now: 0 })
+    expect(await status($, 'agent-1')).not.toMatch(/compact threshold/i)
+  })
+})
+
+describe('limit pause and wake-up', () => {
+  const HIGH: Usage = {
+    context: { tokens: 84_000, window: 200_000, percent: 42 },
+    rateLimits: [
+      { kind: 'five_hour', percentUsed: 85, resetsAt: '2026-10-08T11:00:00.000Z' },
+      { kind: 'seven_day', percentUsed: 41.2, resetsAt: '2026-10-12T09:00:00.000Z' },
+    ],
+  }
+
+  test('no pause hint without a threshold', async ($, on) => {
+    world(on, HIGH)
+    mock.store(on, { settings: { compactThreshold: 'off' } })
+    mock.clock(on, { now: Date.parse('2026-10-08T09:00:00.000Z') })
+    expect(await status($)).not.toMatch(/pause/)
+  })
+
+  test('past the threshold the block asks to pause', async ($, on) => {
+    world(on, HIGH)
+    mock.store(on, { settings: { compactThreshold: 'off', pauseAt: { five_hour: 80 } } })
+    mock.clock(on, { now: Date.parse('2026-10-08T09:00:00.000Z') })
+    expect(await status($)).toMatch(/5-hour limit at 85% ≥ your pause threshold 80%: please pause.*mcp__ctm__limit_wakeup/)
+  })
+
+  test('wakes the model once the window has reset', async ($, on) => {
+    const seen = world(on, HIGH)
+    mock.store(on, { settings: { compactThreshold: 'off', pauseAt: { five_hour: 80 } } })
+    const clock = mock.clock(on, { now: Date.parse('2026-10-08T09:00:00.000Z') })
+    on('session.start', () => ({ cwd: '/' }) as never)
+    await $.session.start({ cwd: '/' } as never)
+    const r = await $.tool.call({ tool: 'mcp__ctm__limit_wakeup', limit: 'five_hour', note: 'Continue with step 4.' } as never)
+    expect(String(r.result)).toContain('wake-up armed')
+    expect(await status($)).toMatch(/wake-up armed for below 80%/)
+    await clock.advance(60 * 60_000)
+    expect(seen.prompts).toHaveLength(0)
+    await clock.advance(61 * 60_000) // past 11:00
+    expect(seen.prompts).toHaveLength(1)
+    expect(seen.prompts[0]).toMatch(/Limit wake-up: the 5-hour limit is below 80% again \(its window reset at 11:00\)/)
+    expect(seen.prompts[0]).toContain('Continue with step 4.')
+    await clock.advance(30 * 60_000)
+    expect(seen.prompts).toHaveLength(1)
+  })
+
+  test('wakes the model once usage drops below the mark', async ($, on) => {
+    const seen = world(on, HIGH)
+    mock.store(on)
+    const clock = mock.clock(on, { now: Date.parse('2026-10-08T09:00:00.000Z') })
+    on('session.start', () => ({ cwd: '/' }) as never)
+    await $.session.start({ cwd: '/' } as never)
+    await $.tool.call({ tool: 'mcp__ctm__limit_wakeup', limit: 'five_hour', belowPercent: 50 } as never)
+    seen.usage.current = { ...HIGH, rateLimits: [{ ...HIGH.rateLimits[0]!, percentUsed: 40 }] }
+    await clock.advance(4 * 60_000)
+    expect(seen.prompts).toHaveLength(1)
+    expect(seen.prompts[0]).toContain('it is at 40%')
+  })
+
+  test('without a pause threshold it waits for the safety mark, and says when there is nothing to wait for', async ($, on) => {
+    world(on)
+    mock.store(on)
+    mock.clock(on, { now: Date.parse('2026-10-08T09:00:00.000Z') })
+    const r = await $.tool.call({ tool: 'mcp__ctm__limit_wakeup', limit: 'five_hour' } as never)
+    expect(String(r.result)).toMatch(/below 95% already/)
+    const r2 = await $.tool.call({ tool: 'mcp__ctm__limit_wakeup', limit: 'five_hour', belowPercent: 50 } as never)
+    expect(String(r2.result)).toMatch(/no need to wait/)
+  })
+})
+
+describe('a threshold set below the current figures', () => {
+  test('the model learns at once that its new compact threshold is passed', async ($, on) => {
+    world(on) // 84k of 200k
+    mock.store(on)
+    mock.clock(on, { now: 0 })
+    const r = String((await $.tool.call({ tool: 'mcp__ctm__settings', compactThreshold: '50k' } as never)).result)
+    expect(r).toMatch(/^Saved\. ATTENTION: a threshold you just set is already passed/)
+    expect(r).toMatch(/⚑ Compact threshold passed \(84k ≥ 50k\)/)
+  })
+
+  test('also for a percent threshold', async ($, on) => {
+    world(on) // 42% of the window
+    mock.store(on)
+    mock.clock(on, { now: 0 })
+    const r = String((await $.tool.call({ tool: 'mcp__ctm__settings', compactThreshold: '30%' } as never)).result)
+    expect(r).toMatch(/ATTENTION/)
+    expect(r).toMatch(/⚑ Compact threshold passed \(84k ≥ 30%\)/)
+  })
+
+  test('and for a pause threshold', async ($, on) => {
+    world(on) // 5-hour limit at 23.5%
+    mock.store(on, { settings: { compactThreshold: 'off' } })
+    mock.clock(on, { now: Date.parse('2026-10-08T09:00:00.000Z') })
+    const r = String((await $.tool.call({ tool: 'mcp__ctm__settings', fiveHourPauseAt: 20 } as never)).result)
+    expect(r).toMatch(/ATTENTION/)
+    expect(r).toMatch(/⚑ 5-hour limit at 23.5% ≥ your pause threshold 20%: please pause/)
+  })
+
+  test('says so when nothing is passed', async ($, on) => {
+    world(on)
+    mock.store(on)
+    mock.clock(on, { now: 0 })
+    const r = String((await $.tool.call({ tool: 'mcp__ctm__settings', compactThreshold: '150k' } as never)).result)
+    expect(r).toMatch(/^Saved\. No threshold is passed right now\./)
+    expect(r).not.toMatch(/⚑ Compact threshold passed/)
+  })
+
+  test('when the person sets it with /ctm, the model is told too', async ($, on) => {
+    world(on)
+    mock.store(on)
+    mock.clock(on, { now: 0 })
+    const r = await $.command.run({ command: 'ctm', args: 'compact 50k' } as never)
+    expect(r.context?.join('\n')).toMatch(/changed the CTM settings with \/ctm[\s\S]*ATTENTION[\s\S]*⚑ Compact threshold passed/)
+  })
+})
+
+describe('built-in safety threshold', () => {
+  const near = (five: number, seven: number): Usage => ({
+    context: { tokens: 84_000, window: 200_000, percent: 42 },
+    rateLimits: [
+      { kind: 'five_hour', percentUsed: five, resetsAt: '2026-10-08T11:00:00.000Z' },
+      { kind: 'seven_day', percentUsed: seven, resetsAt: '2026-10-12T09:00:00.000Z' },
+    ],
+  })
+  const NOW = Date.parse('2026-10-08T09:00:00.000Z')
+
+  test('below 95% / 97% nothing', async ($, on) => {
+    world(on, near(94.9, 96.9))
+    mock.store(on, { settings: { compactThreshold: 'off' } })
+    mock.clock(on, { now: NOW })
+    expect(await status($)).not.toMatch(/⚑/)
+  })
+
+  test('from 95% of the 5-hour and 97% of the 7-day limit it asks to pause, marked as not configurable', async ($, on) => {
+    world(on, near(95, 97))
+    mock.store(on, { settings: { compactThreshold: 'off' } })
+    mock.clock(on, { now: NOW })
+    const r = await status($)
+    expect(r).toMatch(/⚑ 5-hour limit at 95% ≥ the built-in safety threshold 95% \(always active, not configurable/)
+    expect(r).toMatch(/⚑ 7-day limit at 97% ≥ the built-in safety threshold 97% \(always active, not configurable/)
+  })
+
+  test('an own threshold that is passed takes its place; one line per limit', async ($, on) => {
+    world(on, near(96, 10))
+    mock.store(on, { settings: { compactThreshold: 'off', pauseAt: { five_hour: 80 } } })
+    mock.clock(on, { now: NOW })
+    const r = await status($)
+    expect(r).toMatch(/your pause threshold 80%/)
+    expect(r).not.toMatch(/safety/)
+  })
+
+  test('still applies when the own threshold is higher', async ($, on) => {
+    world(on, near(96, 10))
+    mock.store(on, { settings: { compactThreshold: 'off', pauseAt: { five_hour: 99 } } })
+    mock.clock(on, { now: NOW })
+    expect(await status($)).toMatch(/built-in safety threshold 95%/)
+  })
+})

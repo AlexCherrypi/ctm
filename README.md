@@ -77,8 +77,9 @@ The model gets this legend once, in the CTM part of its system prompt (cached).
   - opus → claude-opus-5-5: Opus 5.5 · Best for everyday, complex tasks (effort low–max, fast mode)
     Also accepted: best, sonnet[1m], opus[1m], fable[1m], opusplan, or a full model ID
   ```
-  No plugin call hands this list out, so CTM asks a second, short-lived `claude` for it once per
-  session (the SDK's `initialize` request: about 2 seconds, nothing is sent to a model, no tokens).
+  No plugin call hands this list out, so CTM asks a second, short-lived `claude` for it (the SDK's
+  `initialize` request: about 2 seconds, nothing is sent to a model, no tokens) and keeps the
+  answer for 15 minutes – a failed fetch too, so it does not wait again on every call.
   Nothing is hard-coded: the list follows your account, policy and Claude Code version. Where that
   does not work, it falls back to the bare choices of the `/config` Model row. Says so when a
   policy locks the Model setting.

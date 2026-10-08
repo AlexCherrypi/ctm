@@ -77,6 +77,7 @@ const COMPACT_CONFIRM_MS = 10 * 60_000
 const CLEAR_CONFIRM_MS = 2 * 60_000
 const CHECK_TIMEOUT_MS = 30_000
 const CATALOG_TIMEOUT_MS = 20_000
+const CATALOG_TTL_MS = 15 * 60_000
 
 const MINUTE = 60_000
 
@@ -86,7 +87,9 @@ let lastTurnEndAt = 0
 let lastResetAt = Number.NEGATIVE_INFINITY
 let lastEffortAt = Number.NEGATIVE_INFINITY
 let lastEffort: string | null = null // the main loop's effort, as its last model request carried it
-let catalog: Promise<CatalogEntry[] | null> | null = null // the engine's model list, fetched once per load
+// The engine's model list, kept for CATALOG_TTL_MS – a failed fetch too, so a host where
+// it does not work is not asked again on every call.
+let catalog: { at: number; list: Promise<CatalogEntry[] | null> } | null = null
 let busy = false
 let idle: IdleWatch | null = null
 let pending: PendingReset | null = null
@@ -625,8 +628,8 @@ function isModelName(s: string): boolean {
 // The engine's own model list, as the /model picker shows it: alias, the model it
 // stands for, a line on what it is good for, its effort levels. No plugin call hands
 // it out, so CTM asks a second, short-lived `claude` for it – the SDK's initialize
-// request, which sends nothing to a model and costs no tokens. Fetched once per load
-// of the mod; null where that does not work (the list falls back to the bare aliases).
+// request, which sends nothing to a model and costs no tokens (about 2 s). Kept for
+// 15 minutes; null where that does not work (the list falls back to the bare aliases).
 type CatalogEntry = {
   value: string
   resolvedModel?: string
@@ -665,12 +668,10 @@ function parseCatalog(stdout: string): CatalogEntry[] | null {
   return null
 }
 
-function getCatalog($: EngineInterface): Promise<CatalogEntry[] | null> {
-  catalog ??= fetchCatalog($).then(c => {
-    if (!c) catalog = null // try again next time
-    return c
-  })
-  return catalog
+async function getCatalog($: EngineInterface): Promise<CatalogEntry[] | null> {
+  const now = await $.clock.now()
+  if (!catalog || now - catalog.at >= CATALOG_TTL_MS) catalog = { at: now, list: fetchCatalog($) }
+  return catalog.list
 }
 
 // The current effort: what the main loop's last request carried; before the first

@@ -770,6 +770,7 @@ describe('built-in safety threshold', () => {
 describe('models', () => {
   test('shows the current model and the available ones', async ($, on) => {
     world(on)
+    mock.clock(on, { now: 1_000_000 })
     const r = String((await $.tool.call({ tool: 'mcp__ctm__models' } as never)).result)
     expect(r).toContain('Current model (main agent): claude-opus-5-5')
     expect(r).toContain('Available: default, sonnet, opus, haiku, sonnet[1m], opus[1m] – or a full model ID')
@@ -778,6 +779,7 @@ describe('models', () => {
 
   test('says when a policy locks the Model setting', async ($, on) => {
     world(on, USAGE, { lockedModel: true })
+    mock.clock(on, { now: 1_000_000 })
     const r = String((await $.tool.call({ tool: 'mcp__ctm__models' } as never)).result)
     expect(r).toContain('locked by a policy')
   })
@@ -951,6 +953,7 @@ describe('switch_model', () => {
 describe('model catalog', () => {
   test('lists each model with what it is good for, its target and effort levels', async ($, on) => {
     const seen = world(on, USAGE, { catalog: true, effort: 'medium' })
+    mock.clock(on, { now: 1_000_000 })
     const r = String((await $.tool.call({ tool: 'mcp__ctm__models' } as never)).result)
     expect(r).toContain('- Current effort: medium')
     expect(r).toContain('  - opus → claude-opus-5-5: Opus 5.5 · Best for everyday, complex tasks (effort low–max, fast mode)')
@@ -960,14 +963,29 @@ describe('model catalog', () => {
     expect(seen.spawns[0]).toContain('--input-format')
 
     await $.tool.call({ tool: 'mcp__ctm__models' } as never)
-    expect(seen.spawns.length).toBe(1) // fetched once
+    expect(seen.spawns.length).toBe(1) // cached
   })
 
-  test('without the catalog it falls back to the bare list', async ($, on) => {
-    world(on)
+  test('is kept for 15 minutes, then fetched again', async ($, on) => {
+    const seen = world(on, USAGE, { catalog: true })
+    const clock = mock.clock(on, { now: 1_000_000 })
+    await $.tool.call({ tool: 'mcp__ctm__models' } as never)
+    await clock.advance(14 * 60_000)
+    await $.tool.call({ tool: 'mcp__ctm__models' } as never)
+    expect(seen.spawns.length).toBe(1)
+    await clock.advance(60_000)
+    await $.tool.call({ tool: 'mcp__ctm__models' } as never)
+    expect(seen.spawns.length).toBe(2)
+  })
+
+  test('without the catalog it falls back to the bare list, and does not retry on every call', async ($, on) => {
+    const seen = world(on)
+    mock.clock(on, { now: 1_000_000 })
     const r = String((await $.tool.call({ tool: 'mcp__ctm__models' } as never)).result)
     expect(r).toContain('- Available: default, sonnet, opus, haiku')
     expect(r).not.toContain('good for')
+    await $.tool.call({ tool: 'mcp__ctm__models' } as never)
+    expect(seen.spawns.length).toBe(1)
   })
 
   test('an alias only the catalog lists needs no test request', async ($, on) => {

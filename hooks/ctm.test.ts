@@ -17,15 +17,43 @@ const USAGE: Usage = {
 
 // The world beneath the plugin: figures, compact, clear, queued prompts. Swap
 // `usage.current` mid-test to make the figures move.
-function world(on: On, initial: Usage = USAGE, opts: { headless?: boolean } = {}) {
+const MODEL_OPTIONS = ['default', 'sonnet', 'opus', 'haiku', 'sonnet[1m]', 'opus[1m]']
+const MODEL_IDS: Record<string, string> = {
+  default: 'claude-sonnet-5-5',
+  sonnet: 'claude-sonnet-5-5',
+  opus: 'claude-opus-5-5',
+  haiku: 'claude-haiku-5-5',
+  'claude-haiku-5-5': 'claude-haiku-5-5',
+}
+
+function world(on: On, initial: Usage = USAGE, opts: { headless?: boolean; lockedModel?: boolean; refuseModel?: string } = {}) {
   const usage = { current: initial }
+  const model = { current: 'claude-opus-5-5' }
   const seen = {
     compacts: [] as (string | undefined)[],
     commands: [] as string[],
     prompts: [] as string[],
     tools: [] as { name: string; description: string }[],
     usage,
+    model,
   }
+  on('session.model', () => ({ value: model.current }) as never)
+  on('config.list', () =>
+    ({
+      value: [
+        { key: 'theme', label: 'Theme', kind: 'choice', value: 'dark', options: ['dark', 'light'], provider: { plugin: 'engine', tier: 'core' } },
+        {
+          key: 'model',
+          label: 'Model',
+          kind: 'choice',
+          value: 'Default (recommended)',
+          options: MODEL_OPTIONS,
+          provider: { plugin: 'engine', tier: 'core' },
+          isLocked: opts.lockedModel === true,
+        },
+      ],
+    }) as never,
+  )
   on('session.usage', () => ({ value: usage.current }) as never)
   // Headless: the plugin's own first $.session.compact is refused, as such a host does.
   let refuseCompacts = opts.headless ? 1 : 0
@@ -39,6 +67,14 @@ function world(on: On, initial: Usage = USAGE, opts: { headless?: boolean } = {}
   })
   on('command.run', (_$, e) => {
     seen.commands.push(e.args ? `${e.command} ${e.args}` : e.command)
+    if (e.command === 'model') {
+      // As /model answers: an unknown name or a policy refusal leaves the model as it was.
+      if (opts.refuseModel) return { text: opts.refuseModel }
+      const id = MODEL_IDS[e.args]
+      if (!id) return { text: `Model '${e.args}' not found` }
+      model.current = id
+      return { text: `Set model to \`${id}\` for this session only` }
+    }
     return { text: '' }
   })
   on('prompt.submit', (_$, e) => {
@@ -681,5 +717,164 @@ describe('built-in safety threshold', () => {
     mock.store(on, { settings: { compactThreshold: 'off', pauseAt: { five_hour: 99 } } })
     mock.clock(on, { now: NOW })
     expect(await status($)).toMatch(/built-in safety threshold 95%/)
+  })
+})
+
+describe('models', () => {
+  test('shows the current model and the available ones', async ($, on) => {
+    world(on)
+    const r = String((await $.tool.call({ tool: 'mcp__ctm__models' } as never)).result)
+    expect(r).toContain('Current model (main agent): claude-opus-5-5')
+    expect(r).toContain('Available: default, sonnet, opus, haiku, sonnet[1m], opus[1m] – or a full model ID')
+    expect(r).not.toContain('locked')
+  })
+
+  test('says when a policy locks the Model setting', async ($, on) => {
+    world(on, USAGE, { lockedModel: true })
+    const r = String((await $.tool.call({ tool: 'mcp__ctm__models' } as never)).result)
+    expect(r).toContain('locked by a policy')
+  })
+
+  test('both tools are registered', async ($, on) => {
+    const seen = world(on)
+    on('session.start', () => ({ cwd: '/' }) as never)
+    await $.session.start({ cwd: '/' } as never)
+    expect(seen.tools.map(t => t.name)).toEqual(expect.arrayContaining(['models', 'switch_model']))
+  })
+})
+
+describe('switch_model', () => {
+  const sw = (extra: Record<string, unknown>) => ({ tool: 'mcp__ctm__switch_model', resumePrompt: RESUME, ...extra }) as never
+
+  test('refuses without a resume prompt, from subagents, and an unknown alias', async ($, on) => {
+    world(on)
+    expect((await $.tool.call({ tool: 'mcp__ctm__switch_model', model: 'haiku' } as never)).deny).toMatch(/resumePrompt/)
+    expect((await $.tool.call(sw({ model: 'haiku', agentId: 'sub-1' }))).deny).toMatch(/main agent/)
+    expect((await $.tool.call(sw({ model: 'gpt' }))).deny).toMatch(/unknown model "gpt".*Available: default, sonnet/)
+    expect((await $.tool.call(sw({ model: 'two words' }))).deny).toMatch(/alias or a full model ID/)
+    expect((await $.tool.call(sw({ model: 'haiku', reset: 'compact' }))).deny).toMatch(/instructions/)
+  })
+
+  test('switches after the turn through /model and sends the resume prompt with the new model', async ($, on) => {
+    const seen = world(on)
+    const clock = mock.clock(on, { now: 1_000_000 })
+    on('turn.complete', () => ({ text: '' }) as never)
+
+    const r = await $.tool.call(sw({ model: 'haiku' }))
+    expect(r.deny).toBeUndefined()
+    expect(String(r.result)).toContain('model switch to haiku scheduled for the end of this turn (now on claude-opus-5-5)')
+    expect(seen.commands).toEqual([])
+
+    await $.turn.complete(turn)
+    await clock.advance(2_000)
+
+    expect(seen.commands).toEqual(['model haiku'])
+    expect(seen.model.current).toBe('claude-haiku-5-5')
+    expect(seen.prompts.length).toBe(1)
+    expect(seen.prompts[0]).toContain('[CTM] Your model was switched as you scheduled: now claude-haiku-5-5 (was claude-opus-5-5).')
+    expect(seen.prompts[0]).toContain('Current model: claude-haiku-5-5')
+    expect(seen.prompts[0]).toContain(RESUME)
+    expect(seen.prompts[0]).toContain('after model switch to haiku')
+
+    // shares the cooldown with resets
+    expect((await $.tool.call(sw({ model: 'opus' }))).deny).toMatch(/too recent/)
+    expect((await $.tool.call({ tool: 'mcp__ctm__reset', mode: 'clear', resumePrompt: RESUME } as never)).deny).toMatch(/too recent/)
+  })
+
+  test('accepts a full model id', async ($, on) => {
+    const seen = world(on)
+    const clock = mock.clock(on, { now: 1_000_000 })
+    on('turn.complete', () => ({ text: '' }) as never)
+    expect((await $.tool.call(sw({ model: 'claude-haiku-5-5' }))).deny).toBeUndefined()
+    await $.turn.complete(turn)
+    await clock.advance(2_000)
+    expect(seen.model.current).toBe('claude-haiku-5-5')
+  })
+
+  test('compacts first, then switches, then resumes once', async ($, on) => {
+    const seen = world(on)
+    const clock = mock.clock(on, { now: 1_000_000 })
+    on('turn.complete', () => ({ text: '' }) as never)
+
+    await $.tool.call(sw({ model: 'sonnet', reset: 'compact', instructions: INSTRUCTIONS }))
+    await $.turn.complete(turn)
+    await clock.advance(1_000)
+    expect(seen.compacts).toEqual([INSTRUCTIONS])
+    expect(seen.commands).toEqual([])
+    await clock.advance(1_000)
+
+    expect(seen.commands).toEqual(['model sonnet'])
+    expect(seen.prompts.length).toBe(1)
+    expect(seen.prompts[0]).toContain('[CTM] Your conversation was compacted as you scheduled.')
+    expect(seen.prompts[0]).toContain('now claude-sonnet-5-5 (was claude-opus-5-5)')
+    expect(seen.prompts[0]).toContain('after compact + model switch to sonnet')
+  })
+
+  test('clears first, then switches once the clear is confirmed', async ($, on) => {
+    const seen = world(on)
+    const clock = mock.clock(on, { now: 1_000_000 })
+    on('turn.complete', () => ({ text: '' }) as never)
+
+    await $.tool.call(sw({ model: 'haiku', reset: 'clear' }))
+    await $.turn.complete(turn)
+    await clock.advance(1_000)
+    expect(seen.commands).toEqual(['clear'])
+
+    await $.session.end({ reason: 'clear', sessionId: 's1', resume: { id: 's1' } } as never)
+    await clock.advance(1_000)
+    expect(seen.commands).toEqual(['clear', 'model haiku'])
+    expect(seen.prompts[0]).toContain('[CTM] Your conversation was cleared completely as you scheduled.')
+    expect(seen.prompts[0]).toContain('now claude-haiku-5-5')
+    expect(seen.prompts[0]).toContain(RESUME)
+  })
+
+  test('a refused switch (policy, allowlist) keeps the model and still sends the resume prompt', async ($, on) => {
+    const seen = world(on, USAGE, { refuseModel: "Model 'opus' is not allowed by your organization's policy" })
+    const clock = mock.clock(on, { now: 1_000_000 })
+    on('turn.complete', () => ({ text: '' }) as never)
+
+    await $.tool.call(sw({ model: 'opus' }))
+    await $.turn.complete(turn)
+    await clock.advance(2_000)
+
+    expect(seen.model.current).toBe('claude-opus-5-5')
+    expect(seen.prompts.length).toBe(1)
+    expect(seen.prompts[0]).toContain(
+      `[CTM] The switch to model "opus" you scheduled failed: Model 'opus' is not allowed by your organization's policy. You are still on claude-opus-5-5.`,
+    )
+    expect(seen.prompts[0]).toContain(RESUME)
+  })
+
+  test('a model id the engine does not know is reported as failed', async ($, on) => {
+    const seen = world(on)
+    const clock = mock.clock(on, { now: 1_000_000 })
+    on('turn.complete', () => ({ text: '' }) as never)
+    await $.tool.call(sw({ model: 'claude-nonexistent-1' }))
+    await $.turn.complete(turn)
+    await clock.advance(2_000)
+    expect(seen.prompts[0]).toContain(`failed: Model 'claude-nonexistent-1' not found. You are still on claude-opus-5-5.`)
+  })
+
+  test('a failed reset skips the switch', async ($, on) => {
+    const seen = world(on, USAGE, { headless: true })
+    const clock = mock.clock(on, { now: 1_000_000 })
+    on('turn.complete', () => ({ text: '' }) as never)
+    await $.tool.call(sw({ model: 'haiku', reset: 'compact', instructions: INSTRUCTIONS }))
+    await $.turn.complete(turn)
+    await clock.advance(11 * 60_000)
+    expect(seen.commands).toEqual([`compact ${INSTRUCTIONS}`])
+    expect(seen.model.current).toBe('claude-opus-5-5')
+    expect(seen.prompts[0]).toContain('The model switch to "haiku" was skipped as well.')
+  })
+
+  test('an interrupted turn drops the scheduled switch', async ($, on) => {
+    const seen = world(on)
+    const clock = mock.clock(on, { now: 1_000_000 })
+    on('turn.complete', () => ({ text: '' }) as never)
+    await $.tool.call(sw({ model: 'haiku' }))
+    await $.turn.complete({ ...(turn as object), isAborted: true } as never)
+    await clock.advance(2_000)
+    expect(seen.commands).toEqual([])
+    expect(seen.prompts).toEqual([])
   })
 })

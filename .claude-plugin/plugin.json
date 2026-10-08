@@ -1,7 +1,7 @@
 {
   "name": "ctm",
-  "version": "0.6.2",
-  "description": "Context and Token Manager: keeps the model informed about its context window and the 5-hour / 7-day rate limits, each with its change since the last report, and lets it compact or clear itself – always with a resume prompt.",
+  "version": "0.7.0",
+  "description": "Context and Token Manager: keeps the model informed about its context window and the 5-hour / 7-day rate limits, each with its change since the last report, and lets it compact or clear itself or switch its own model – always with a resume prompt.",
   "author": {
     "name": "AlexCherrypi"
   },
@@ -32,7 +32,7 @@
     },
     "resetCooldownMinutes": {
       "type": "number",
-      "title": "Minimum time between compact/clear (minutes)",
+      "title": "Minimum time between compact/clear/model switch (minutes)",
       "description": "Guards against loops in which the model keeps resetting itself.",
       "default": 10
     },

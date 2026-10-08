@@ -1,7 +1,7 @@
 {
   "name": "ctm",
-  "version": "0.7.0",
-  "description": "Context and Token Manager: keeps the model informed about its context window and the 5-hour / 7-day rate limits, each with its change since the last report, and lets it compact or clear itself or switch its own model – always with a resume prompt.",
+  "version": "0.8.0",
+  "description": "Context and Token Manager: keeps the model informed about its context window and the 5-hour / 7-day rate limits, each with its change since the last report, and lets it compact or clear itself, switch its own model or change its own effort – always with a resume prompt.",
   "author": {
     "name": "AlexCherrypi"
   },

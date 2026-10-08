@@ -2,8 +2,8 @@
 
 A Claude Code mod that keeps the model informed about its context window and the account's
 5-hour / 7-day rate limits, each with its change since the last report, in a short block – and
-lets the model compact or clear its own conversation, always with a resume prompt so it
-carries on afterwards.
+lets the model compact or clear its own conversation or switch its own model, always with a
+resume prompt so it carries on afterwards.
 
 ## What the model sees
 
@@ -45,7 +45,7 @@ The model gets this legend once, in the CTM part of its system prompt (cached).
 | On every prompt you send | The current figures (turn off with `attachToPrompts`). |
 | While it works | At most every `intervalMinutes` (default 3, changeable by the model and by you) on a tool result, tracked per agent. |
 | While idle, if it turned that on | A wake-up prompt with the figures every `intervalMinutes` (each starts a turn). |
-| After a CTM compact/clear | What happened, the CTM briefing, its resume prompt and the current figures. |
+| After a CTM compact/clear/model switch | What happened, the model it now runs on, the CTM briefing, its resume prompt and the current figures. |
 
 ## Tools for the model
 
@@ -69,7 +69,30 @@ The model gets this legend once, in the CTM part of its system prompt (cached).
   - At least `resetCooldownMinutes` (default 10) between two resets.
   - If you interrupt the turn (Esc), the scheduled reset is dropped.
 
-You get a toast whenever the model schedules a reset, turns idle updates on, changes the
+- `mcp__ctm__models` – the model the session runs on now, and the models it can switch to: the
+  choices of the `/config` Model row (aliases such as `sonnet`, `opus`, `haiku`, `[1m]` variants),
+  or any full model ID. Says so when a policy locks the Model setting.
+- `mcp__ctm__switch_model` `{ model, resumePrompt, reset?, instructions? }` – schedules a model
+  switch for the end of the current turn, e.g. to a smaller model for routine work or when the
+  limits run high, or to a larger one for a hard problem. Rules:
+  - Runs as `/model <name>`: **for this session only**, never written to your settings.
+  - `resumePrompt` is required and written as for `reset`; afterwards the model gets it together
+    with the model it now runs on.
+  - `reset: "compact"` (with `instructions`) or `"clear"` runs that reset **first**, then the
+    switch. A switch rebuilds the prompt cache for the whole conversation on the new model, so
+    with a large context the combination is much cheaper.
+  - **First it checks that the model exists**, right when the tool is called: an alias from the
+    `/config` Model row counts as existing; any other name gets a one-token test request (the
+    API answers `404 model_not_found` for an unknown name, the engine refuses a model a policy or
+    allowlist blocks). If the check fails, nothing is scheduled and the model is told which check
+    failed and why.
+  - If the switch itself then fails, the model stays as it was and the resume prompt arrives with
+    the command that was run (`/model <name>`) and the engine's answer verbatim. If the reset
+    fails, the switch is skipped too.
+  - Main agent only; shares the `resetCooldownMinutes` gap with `reset`; dropped if you
+    interrupt the turn.
+
+You get a toast whenever the model schedules a reset or a model switch, turns idle updates on, changes the
 settings, or arms or fires a limit wake-up.
 
 ## Thresholds and wake-ups
@@ -121,7 +144,7 @@ The model is told when you change them.
 | `compactThreshold` | empty | `300k`, `30%`, `off`; empty = unset (the model is nudged to ask you) |
 | `fiveHourPauseAt` | 0 | Pause threshold for the 5-hour limit in percent, 0 = off |
 | `sevenDayPauseAt` | 0 | Pause threshold for the 7-day limit in percent, 0 = off |
-| `resetCooldownMinutes` | 10 | Minimum time between two compact/clear |
+| `resetCooldownMinutes` | 10 | Minimum time between two compact/clear/model switches |
 | `attachToPrompts` | true | Attach the figures to your own prompts |
 | `timeZone` | empty | IANA zone for every time shown, e.g. `Europe/Berlin`. Empty = automatic: `TZ`, then `/etc/localtime` or `/etc/timezone`, then the system zone, else UTC |
 
@@ -147,4 +170,6 @@ when signed in with a claude.ai subscription, and only after the first response 
 - Settings are kept across sessions. Everything else (idle updates, armed wake-ups, cooldown, the
   previous report for Δ) is per session and survives `/clear`, not a reload of the mod.
 - Idle updates cost quota: each one is a turn of its own.
+- Like a reset, a scheduled model switch runs after the turn has ended, so a one-shot `claude -p`
+  exits before it happens; long-lived sessions (interactive, SDK, cloud) run it.
 - Develop / check: `claude plugin validate ./ctm` and `claude plugin test ./ctm`.

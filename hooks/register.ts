@@ -12,7 +12,9 @@ import type { EngineInterface, Register } from 'claude-code'
 //    prompt, and a compact only with instructions for the summary.
 // 3. A short CTM briefing sits in the system prompt for good (it survives compact
 //    and clear) and is sent once more after every CTM reset.
-// 4. Settings the model (`settings` tool) or the person (/ctm, userConfig) can set:
+// 4. Lets the model see its own model and the models it can switch to, and switch
+//    (on its own or together with a compact or clear) – again with a resume prompt.
+// 5. Settings the model (`settings` tool) or the person (/ctm, userConfig) can set:
 //    the update interval, a compact threshold (the blocks remind the model to compact
 //    once the context passes it; while it is unset they remind it now and then to ask
 //    the person for one), and pause thresholds for the 5-hour and 7-day limits (the
@@ -24,7 +26,9 @@ import type { EngineInterface, Register } from 'claude-code'
 // this session; a reload of the mod starts it over.
 
 type Mode = 'compact' | 'clear'
-type PendingReset = { mode: Mode; instructions: string | null; resumePrompt: string }
+// What runs at the end of the turn: a compact or clear, a model switch, or both (the
+// reset first, so the new model only re-caches the smaller conversation).
+type PendingReset = { mode: Mode | null; model: string | null; instructions: string | null; resumePrompt: string }
 type IdleWatch = { until: number | null }
 type LimitReading = { percent: number; resetsAt: string | null }
 type Snapshot = {
@@ -47,6 +51,8 @@ const T_IDLE = 'mcp__ctm__idle_updates'
 const T_RESET = 'mcp__ctm__reset'
 const T_SETTINGS = 'mcp__ctm__settings'
 const T_WAKEUP = 'mcp__ctm__limit_wakeup'
+const T_MODELS = 'mcp__ctm__models'
+const T_SWITCH = 'mcp__ctm__switch_model'
 const STORE_SETTINGS = 'settings'
 const NAG_EVERY_MS = 30 * 60_000
 // Built-in safety net: this close to a limit the blocks always ask the model to pause,
@@ -60,6 +66,7 @@ const IDLE_TICK_MS = 30_000
 const RESET_DELAY_MS = 1_000
 const COMPACT_CONFIRM_MS = 10 * 60_000
 const CLEAR_CONFIRM_MS = 2 * 60_000
+const CHECK_TIMEOUT_MS = 30_000
 
 const MINUTE = 60_000
 
@@ -104,6 +111,7 @@ const INFO = [
   `- ${T_IDLE}: blocks while you are idle as well (each one starts a new turn and costs quota; use sparingly, with maxMinutes).`,
   `- ${T_RESET}: schedules a compact (summary; needs instructions) or a clear (everything gone) for the end of your turn, then sends you your resumePrompt so you carry on. The resumePrompt is what you can rely on afterwards: next step, key facts, and every important rule – no length limit, be complete; or write them to a file and give its exact path in the resumePrompt.`,
   'A good moment for compact/clear is right after finishing a sub-task, before the context gets tight – never in the middle of a change.',
+  `- ${T_MODELS}: your current model and the models you can switch to. ${T_SWITCH}: switches the model at the end of your turn – alone or together with a compact/clear (cheaper: the new model then re-caches only the smaller conversation) – and sends you your resumePrompt afterwards, as a reset does. Switch to a smaller model for simple, routine work, to a larger one for hard problems.`,
   `- ${T_SETTINGS}: how often these blocks come (1–${MAX_INTERVAL_MINUTES} min), a compact threshold (tokens like 300k, or a % of the window), and pause thresholds for the 5-hour and 7-day limits. No arguments = show the current settings. Kept across sessions.`,
   '- Past the compact threshold the blocks remind you to compact: do it at the next clean point if your task allows it (a smaller context makes every further request cheaper on the limits) – never break off critical work for it.',
   '- Built-in safety net, always active and not configurable: from 95% of the 5-hour limit and 97% of the 7-day limit the blocks ask you to pause, even with no pause threshold set.',
@@ -527,18 +535,110 @@ async function report($: EngineInterface, reason: string, recipient = 'main'): P
   return lines.join('\n')
 }
 
+// ---------------------------------------------------------------- Models
+
+type ModelInfo = { current: string | null; setting: string | null; options: string[]; locked: boolean }
+
+// The current model as /model shows it, and the choices of the /config Model row
+// (aliases; a full model id works as well). Each part is null/empty where the host
+// has nothing to say.
+async function modelInfo($: EngineInterface): Promise<ModelInfo> {
+  const current = (await safe(() => $.session.model())) ?? null
+  const row = (await safe(() => $.config.list()))?.find(r => r.key === 'model')
+  return {
+    current,
+    setting: row?.value === undefined ? null : String(row.value),
+    options: [...(row?.options ?? [])],
+    locked: (row as { isLocked?: boolean } | undefined)?.isLocked === true,
+  }
+}
+
+function describeModels(m: ModelInfo): string {
+  const lines = ['CTM models:', `- Current model (main agent): ${m.current ?? 'unknown'}`]
+  if (m.setting !== null) lines.push(`- Model setting: ${m.setting}`)
+  lines.push(
+    m.options.length > 0
+      ? `- Available: ${m.options.join(', ')} – or a full model ID (e.g. claude-…).`
+      : '- Available: the host lists none; aliases like sonnet, opus, haiku or a full model ID usually work.',
+  )
+  if (m.locked) lines.push('- The Model setting is locked by a policy: a switch may be refused.')
+  lines.push(
+    `Switch with ${T_SWITCH} (at the end of your turn, with a resumePrompt). It is for this session only; the ` +
+      'prompt cache is rebuilt on the new model, so combine it with a compact or clear when the context is large.',
+  )
+  return lines.join('\n')
+}
+
+// A model id or alias: no spaces, nothing odd. The engine decides whether it exists.
+function isModelName(s: string): boolean {
+  return /^[A-Za-z0-9][\w.:\/@-]*(\[\w+\])?$/.test(s) && s.length <= 200
+}
+
+// Does the model exist and may this session use it? Aliases the host lists exist; any
+// other name gets a one-token test request, resolved and allowlist-checked like
+// --model: the API answers 404 model_not_found for a name it does not know, and the
+// engine refuses a model a policy blocks. Only a call cut short leaves it open (null):
+// the switch itself still checks.
+async function checkModel($: EngineInterface, model: string, options: string[]): Promise<{ check: string; error: string | null }> {
+  if (options.includes(model)) return { check: 'listed in the /config Model row', error: null }
+  const check = `a one-token test request to "${model}"`
+  try {
+    const r = await $.model.complete({ model, prompt: 'Reply with: ok', maxTokens: 1, timeoutMs: CHECK_TIMEOUT_MS })
+    refusedBy(r)
+    if (r.isAnswered || r.reason !== 'api-error') return { check, error: null }
+    const status = (r as { status?: number }).status
+    const kind = (r as { error?: string }).error
+    return { check, error: `the API answered ${[status, kind].filter(x => x !== undefined).join(' ') || 'with an error'}` }
+  } catch (err) {
+    return { check, error: `the engine refused it: ${errorText(err)}` }
+  }
+}
+
+// Switches through /model <name> – for this session only, never in the settings – and
+// checks the outcome: the command answers "Set model to …" on success, and a name it
+// does not know or a policy refusal leaves the model as it was.
+async function switchModel($: EngineInterface, model: string): Promise<{ ok: boolean; note: string }> {
+  const before = (await safe(() => $.session.model())) ?? null
+  let text = ''
+  try {
+    const r = await $.command.run({ command: 'model', args: model })
+    refusedBy(r)
+    text = (r.text ?? '').trim()
+  } catch (err) {
+    text = errorText(err)
+  }
+  const after = (await safe(() => $.session.model())) ?? null
+  const ok = /^set model to\b/i.test(text) || (before !== null && after !== null && after !== before)
+  if (ok) {
+    return { ok, note: `[CTM] Your model was switched as you scheduled: now ${after ?? model}${before && before !== after ? ` (was ${before})` : ''}.` }
+  }
+  return {
+    ok,
+    note:
+      `[CTM] The switch to model "${model}" you scheduled failed. Command: /model ${model} – the engine answered: ` +
+      `${text ? `"${text}"` : 'nothing'}. You are still on ${after ?? before ?? 'the previous model'}. ` +
+      `See ${T_MODELS} for what is available.`,
+  }
+}
+
 // ---------------------------------------------------------------- Reset (runs after the turn)
 
+function describeJob(job: { mode: Mode | null; model: string | null }): string {
+  return [job.mode, job.model ? `model switch to ${job.model}` : null].filter(Boolean).join(' + ')
+}
+
 async function resetMessage($: EngineInterface, job: PendingReset, note: string): Promise<string> {
+  const model = (await safe(() => $.session.model())) ?? null
   return [
     note,
+    ...(model ? [`Current model: ${model}`] : []),
     '',
     INFO,
     '',
     '--- Your resume prompt ---',
     job.resumePrompt,
     '',
-    await report($, `after ${job.mode}`),
+    await report($, `after ${describeJob(job)}`),
   ].join('\n')
 }
 
@@ -548,6 +648,7 @@ async function resetMessage($: EngineInterface, job: PendingReset, note: string)
 // /compact command, and a clear always runs as the /clear command. The resume prompt
 // goes out only once the engine confirms the reset – session.compact resolved, or
 // session.end with reason "clear" – otherwise the model is told the reset failed.
+// A model switch always runs as /model <name>, after the reset if there is one.
 
 // A host or hook can refuse an engine call by rejecting it or by answering { deny }.
 function refusedBy(result: unknown): void {
@@ -567,6 +668,11 @@ function finishReset($: EngineInterface, job: PendingReset, note: string): void 
 }
 
 async function deliverResume($: EngineInterface, job: PendingReset, note: string): Promise<void> {
+  if (job.model) {
+    const sw = await switchModel($, job.model)
+    if (!sw.ok) toast($, `CTM: model switch failed – ${job.model}`)
+    note = note ? `${note}\n${sw.note}` : sw.note
+  }
   const now = await $.clock.now()
   lastResetAt = now
   lastSent.set('main', now)
@@ -578,13 +684,14 @@ async function failReset($: EngineInterface, job: PendingReset, message: string)
   awaitTimer?.cancel()
   awaitTimer = null
   toast($, `CTM: ${job.mode} failed – ${message}`)
+  const skipped = job.model ? ` The model switch to "${job.model}" was skipped as well.` : ''
   await $.prompt.submit({
-    text: `[CTM] The ${job.mode} you scheduled failed (${message}). The conversation is unchanged; carry on as usual.\n\n--- Your resume prompt ---\n${job.resumePrompt}`,
+    text: `[CTM] The ${job.mode} you scheduled failed (${message}). The conversation is unchanged; carry on as usual.${skipped}\n\n--- Your resume prompt ---\n${job.resumePrompt}`,
   })
 }
 
 // Runs /compact or /clear as a command and waits for the engine's confirmation.
-async function runAsCommand($: EngineInterface, job: PendingReset): Promise<void> {
+async function runAsCommand($: EngineInterface, job: PendingReset & { mode: Mode }): Promise<void> {
   awaiting = job
   awaitTimer?.cancel()
   const timeout = job.mode === 'compact' ? COMPACT_CONFIRM_MS : CLEAR_CONFIRM_MS
@@ -604,7 +711,8 @@ async function runReset($: EngineInterface): Promise<void> {
   if (busy) return // a new turn is already running: try again at its turn.complete
   pending = null
 
-  if (job.mode === 'clear') return runAsCommand($, job)
+  if (job.mode === null) return deliverResume($, job, '') // a model switch alone
+  if (job.mode === 'clear') return runAsCommand($, { ...job, mode: job.mode })
 
   try {
     const res = await $.session.compact({ instructions: job.instructions ?? undefined })
@@ -618,7 +726,7 @@ async function runReset($: EngineInterface): Promise<void> {
         : '[CTM] Your conversation was compacted as you scheduled.',
     )
   } catch {
-    await runAsCommand($, job) // e.g. headless: compaction runs as the /compact command there
+    await runAsCommand($, { ...job, mode: job.mode }) // e.g. headless: compaction runs as the /compact command there
   }
 }
 
@@ -817,6 +925,55 @@ export const register: Register = (on, options) => {
       },
       isDeferred: false,
     })
+    await $.tool.register({
+      name: 'models',
+      description:
+        'CTM: Shows your current model and the models you can switch to (aliases such as sonnet, opus, haiku, ' +
+        `their [1m] variants, or a full model ID). Switch with ${T_SWITCH}.`,
+      inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+      isDeferred: false,
+    })
+    await $.tool.register({
+      name: 'switch_model',
+      description:
+        'CTM: Schedules a switch of your model for the END of your current turn – for this session only. ' +
+        'Afterwards you automatically receive resumePrompt as a new message (with the model you now run on) and ' +
+        'continue with it. Finish your answer promptly after calling this. ' +
+        `See ${T_MODELS} for the current model and what is available.\n` +
+        '- Use a smaller model (e.g. haiku, sonnet) for simple, routine work or when the limits run high, a larger ' +
+        'one (e.g. opus) for hard problems.\n' +
+        '- A switch rebuilds the prompt cache on the new model for the whole conversation. With a large context, ' +
+        'combine it with reset "compact" (needs instructions) or "clear": the reset runs first, then the switch.\n' +
+        '- If the host or a policy refuses the model, you stay on the current one and are told why, with your ' +
+        'resumePrompt.\n' +
+        'Write the resumePrompt as for a reset: 1. next step, 2. key facts, 3. every important rule – no length ' +
+        'limit; or the next step plus the exact path of a file holding the rest. ' +
+        `Shares the ${cooldownMs / MINUTE}-minute minimum gap with ${T_RESET}. Main agent only.`,
+      inputSchema: {
+        type: 'object',
+        properties: {
+          model: { type: 'string', description: `An alias or full model ID, as ${T_MODELS} lists them.` },
+          resumePrompt: {
+            type: 'string',
+            description:
+              'Required, no length limit: the message you continue with after the switch – next step, key facts, ' +
+              'and every important rule; or the next step plus the exact path of a file holding them.',
+          },
+          reset: {
+            type: 'string',
+            enum: ['compact', 'clear'],
+            description: 'Optional: compact or clear the conversation first, then switch.',
+          },
+          instructions: {
+            type: 'string',
+            description: 'Required with reset "compact": what the summary must keep.',
+          },
+        },
+        required: ['model', 'resumePrompt'],
+        additionalProperties: false,
+      },
+      isDeferred: false,
+    })
     await safe(() =>
       $.command.register({
         name: 'ctm',
@@ -904,7 +1061,7 @@ export const register: Register = (on, options) => {
     if (pending) {
       if (e.isAborted) {
         // Interrupted: the person is stepping in, so nothing fires on its own.
-        toast($, `CTM: scheduled ${pending.mode} dropped (turn interrupted)`)
+        toast($, `CTM: scheduled ${describeJob(pending)} dropped (turn interrupted)`)
         pending = null
       } else {
         $.clock.after(RESET_DELAY_MS, () => void runReset($))
@@ -959,11 +1116,11 @@ export const register: Register = (on, options) => {
     if (wait > 0) return { deny: `CTM: the last reset was too recent. Next one possible ${fmtIn(wait)}.` }
 
     const replaced = pending !== null
-    pending = { mode, instructions: mode === 'compact' ? instructions : null, resumePrompt }
+    pending = { mode, model: null, instructions: mode === 'compact' ? instructions : null, resumePrompt }
     toast($, `CTM: the model scheduled a ${mode} for the end of this turn`)
     return {
       result:
-        `CTM: ${mode} scheduled for the end of this turn${replaced ? ' (replaces the reset scheduled before)' : ''}. ` +
+        `CTM: ${mode} scheduled for the end of this turn${replaced ? ' (replaces the reset or switch scheduled before)' : ''}. ` +
         'Finish your answer now; you will then receive your resume prompt.',
     }
   }).catch(() => ({ deny: 'CTM: could not schedule the reset.' }))
@@ -1015,6 +1172,55 @@ export const register: Register = (on, options) => {
         'to carry on.',
     }
   }).catch(() => ({ deny: 'CTM: could not arm the wake-up.' }))
+
+  on('tool.call', { tool: T_MODELS }, async $ => {
+    return { result: describeModels(await modelInfo($)) }
+  }).catch(() => ({ deny: 'CTM: could not read the models.' }))
+
+  on('tool.call', { tool: T_SWITCH }, async ($, e) => {
+    if (e.agentId) return { deny: 'CTM: only the main agent may switch the model.' }
+    const input = e as unknown as { model?: unknown; resumePrompt?: unknown; reset?: unknown; instructions?: unknown }
+    const model = typeof input.model === 'string' ? input.model.trim() : ''
+    if (!isModelName(model)) return { deny: `CTM: "model" must be an alias or a full model ID (see ${T_MODELS}).` }
+    const mode = input.reset ?? null
+    if (mode !== null && mode !== 'compact' && mode !== 'clear') return { deny: 'CTM: "reset" must be "compact", "clear" or left out.' }
+    const resumePrompt = typeof input.resumePrompt === 'string' ? input.resumePrompt.trim() : ''
+    if (resumePrompt.length < MIN_RESUME_CHARS) {
+      return { deny: `CTM: no model switch without a meaningful resumePrompt (at least ${MIN_RESUME_CHARS} characters).` }
+    }
+    const instructions = typeof input.instructions === 'string' ? input.instructions.trim() : ''
+    if (mode === 'compact' && instructions.length < MIN_INSTRUCTION_CHARS) {
+      return {
+        deny: `CTM: reset "compact" needs "instructions" (at least ${MIN_INSTRUCTION_CHARS} characters): what the summary must keep.`,
+      }
+    }
+    const now = await $.clock.now()
+    const wait = lastResetAt + cooldownMs - now
+    if (wait > 0) return { deny: `CTM: the last reset or model switch was too recent. Next one possible ${fmtIn(wait)}.` }
+
+    // First: does the model exist (and may this session use it)? Only then is the switch scheduled.
+    const info = await modelInfo($)
+    const { check, error } = await checkModel($, model, info.options)
+    if (error) {
+      return {
+        deny:
+          `CTM: model "${model}" is not available – nothing was scheduled. Check: ${check}; ${error}. ` +
+          `Available: ${info.options.length > 0 ? info.options.join(', ') : 'see ' + T_MODELS} – or a full model ID.`,
+      }
+    }
+
+    const replaced = pending !== null
+    pending = { mode, model, instructions: mode === 'compact' ? instructions : null, resumePrompt }
+    toast($, `CTM: the model scheduled a ${describeJob(pending)} for the end of this turn`)
+    return {
+      result:
+        `CTM: model "${model}" checked (${check}). ` +
+        `${describeJob(pending)} scheduled for the end of this turn (now on ${info.current ?? 'unknown'})` +
+        `${replaced ? '; replaces the reset or switch scheduled before' : ''}.` +
+        `${info.locked ? ' Note: the Model setting is locked by a policy – the switch may be refused.' : ''} ` +
+        'Finish your answer now; you will then receive your resume prompt.',
+    }
+  }).catch(() => ({ deny: 'CTM: could not schedule the model switch.' }))
 
   // ---------------------------------------------------------------- Figures while working
 

@@ -1057,3 +1057,27 @@ describe('set_effort', () => {
     expect(seen.prompts[0]).toContain('after model switch to haiku + effort low')
   })
 })
+
+describe('cooldowns', () => {
+  test('the effort gap is its own option, independent of the reset gap', { options: { effortCooldownMinutes: 2, resetCooldownMinutes: 30 } }, async ($, on) => {
+    world(on)
+    const clock = mock.clock(on, { now: 1_000_000 })
+    on('turn.complete', () => ({ text: '' }) as never)
+    await $.tool.call({ tool: 'mcp__ctm__set_effort', level: 'high' } as never)
+    await $.turn.complete(turn)
+    await clock.advance(2_000)
+    expect((await $.tool.call({ tool: 'mcp__ctm__set_effort', level: 'max' } as never)).deny).toMatch(/too recent/)
+    await clock.advance(2 * 60_000)
+    expect((await $.tool.call({ tool: 'mcp__ctm__set_effort', level: 'max' } as never)).deny).toBeUndefined()
+  })
+
+  test('0 turns the effort gap off', { options: { effortCooldownMinutes: 0 } }, async ($, on) => {
+    world(on)
+    const clock = mock.clock(on, { now: 1_000_000 })
+    on('turn.complete', () => ({ text: '' }) as never)
+    await $.tool.call({ tool: 'mcp__ctm__set_effort', level: 'high' } as never)
+    await $.turn.complete(turn)
+    await clock.advance(2_000)
+    expect((await $.tool.call({ tool: 'mcp__ctm__set_effort', level: 'max' } as never)).deny).toBeUndefined()
+  })
+})

@@ -113,7 +113,8 @@ The model gets this legend once, in the CTM part of its system prompt (cached).
   - Checked against the levels the current model supports; a refusal comes back with the command
     and the engine's answer verbatim, the effort unchanged.
   - If you told the model to keep a model or an effort level, it is told not to change it itself.
-  - Main agent only; its own `resetCooldownMinutes` gap between two effort changes; joins a reset or
+  - Main agent only; its own gap between two effort changes (`effortCooldownMinutes`, independent
+    of the reset/switch gap); joins a reset or
     model switch scheduled in the same turn; dropped if you interrupt the turn.
   - The current effort is read from the model requests themselves (`turn.step`), so it is exact
     after any change, yours included.
@@ -170,7 +171,8 @@ The model is told when you change them.
 | `compactThreshold` | empty | `300k`, `30%`, `off`; empty = unset (the model is nudged to ask you) |
 | `fiveHourPauseAt` | 0 | Pause threshold for the 5-hour limit in percent, 0 = off |
 | `sevenDayPauseAt` | 0 | Pause threshold for the 7-day limit in percent, 0 = off |
-| `resetCooldownMinutes` | 10 | Minimum time between two compact/clear/model switches |
+| `resetCooldownMinutes` | 10 | Minimum time between two compact/clear/model switches (one shared gap), 0 = none |
+| `effortCooldownMinutes` | 10 | Minimum time between two effort changes, independent of the one above, 0 = none |
 | `attachToPrompts` | true | Attach the figures to your own prompts |
 | `timeZone` | empty | IANA zone for every time shown, e.g. `Europe/Berlin`. Empty = automatic: `TZ`, then `/etc/localtime` or `/etc/timezone`, then the system zone, else UTC |
 

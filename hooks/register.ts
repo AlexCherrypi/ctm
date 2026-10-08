@@ -105,7 +105,8 @@ const watches = new Map<LimitKind, LimitWatch>()
 let configIntervalMinutes = 3
 let configCompactThreshold = ''
 let configPauseAt: Record<LimitKind, number> = { five_hour: 0, seven_day: 0 }
-let cooldownMs = 10 * MINUTE
+let cooldownMs = 10 * MINUTE // between two resets or model switches
+let effortCooldownMs = 10 * MINUTE // between two effort changes
 let attachToPrompts = true
 let configuredTimeZone = ''
 let timeZone: string | null = null // resolved on the first report
@@ -938,6 +939,7 @@ export const register: Register = (on, options) => {
   lastWatchCheckAt = 0
   watches.clear()
   cooldownMs = Math.max(0, Number(options.resetCooldownMinutes ?? 10)) * MINUTE
+  effortCooldownMs = Math.max(0, Number(options.effortCooldownMinutes ?? 10)) * MINUTE
   attachToPrompts = options.attachToPrompts !== false
   configuredTimeZone = String(options.timeZone ?? '')
   timeZone = null
@@ -1135,7 +1137,7 @@ export const register: Register = (on, options) => {
         'problem turns out harder than it looked. Lower it (low, medium) for simple, routine work – it saves time ' +
         'and quota. "auto" hands the choice back to Claude Code.\n' +
         '- If the user told you to keep a certain effort, do not change it on your own.\n' +
-        `At least ${cooldownMs / MINUTE} minutes between two effort changes. Main agent only.`,
+        `At least ${effortCooldownMs / MINUTE} minutes between two effort changes. Main agent only.`,
       inputSchema: {
         type: 'object',
         properties: {
@@ -1418,7 +1420,7 @@ export const register: Register = (on, options) => {
       return { deny: `CTM: "level" must be one of ${EFFORT_LEVELS.join(', ')}.` }
     }
     const now = await $.clock.now()
-    const wait = lastEffortAt + cooldownMs - now
+    const wait = lastEffortAt + effortCooldownMs - now
     if (wait > 0) return { deny: `CTM: the last effort change was too recent. Next one possible ${fmtIn(wait)}.` }
 
     const info = await modelInfo($)

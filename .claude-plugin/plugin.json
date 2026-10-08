@@ -33,7 +33,13 @@
     "resetCooldownMinutes": {
       "type": "number",
       "title": "Minimum time between compact/clear/model switch (minutes)",
-      "description": "Guards against loops in which the model keeps resetting itself.",
+      "description": "Guards against loops in which the model keeps resetting itself or switching its model. 0 = no pause.",
+      "default": 10
+    },
+    "effortCooldownMinutes": {
+      "type": "number",
+      "title": "Minimum time between effort changes (minutes)",
+      "description": "Guards against loops in which the model keeps changing its own effort. Independent of the compact/clear/model switch pause. 0 = no pause.",
       "default": 10
     },
     "attachToPrompts": {

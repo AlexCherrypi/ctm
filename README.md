@@ -2,8 +2,8 @@
 
 A Claude Code mod that keeps the model informed about its context window and the account's
 5-hour / 7-day rate limits, each with its change since the last report, in a short block – and
-lets the model compact or clear its own conversation or switch its own model, always with a
-resume prompt so it carries on afterwards.
+lets the model compact or clear its own conversation, switch its own model or change its own
+effort, always with a resume prompt so it carries on afterwards.
 
 ## What the model sees
 
@@ -45,7 +45,7 @@ The model gets this legend once, in the CTM part of its system prompt (cached).
 | On every prompt you send | The current figures (turn off with `attachToPrompts`). |
 | While it works | At most every `intervalMinutes` (default 3, changeable by the model and by you) on a tool result, tracked per agent. |
 | While idle, if it turned that on | A wake-up prompt with the figures every `intervalMinutes` (each starts a turn). |
-| After a CTM compact/clear/model switch | What happened, the model it now runs on, the CTM briefing, its resume prompt and the current figures. |
+| After a CTM compact/clear/model switch/effort change | What happened, the model and effort it now runs on, the CTM briefing, its resume prompt and the current figures. |
 
 ## Tools for the model
 
@@ -69,9 +69,20 @@ The model gets this legend once, in the CTM part of its system prompt (cached).
   - At least `resetCooldownMinutes` (default 10) between two resets.
   - If you interrupt the turn (Esc), the scheduled reset is dropped.
 
-- `mcp__ctm__models` – the model the session runs on now, and the models it can switch to: the
-  choices of the `/config` Model row (aliases such as `sonnet`, `opus`, `haiku`, `[1m]` variants),
-  or any full model ID. Says so when a policy locks the Model setting.
+- `mcp__ctm__models` – the model and effort the session runs on now, and the models it can switch
+  to. Where it can, CTM shows them **as Claude Code describes them in its `/model` picker**: alias →
+  model, what each is good for, its effort levels and fast mode, e.g.
+  ```
+  - haiku → claude-haiku-5-5: Haiku 5.5 · Fastest for quick answers (effort low–max)
+  - opus → claude-opus-5-5: Opus 5.5 · Best for everyday, complex tasks (effort low–max, fast mode)
+    Also accepted: best, sonnet[1m], opus[1m], fable[1m], opusplan, or a full model ID
+  ```
+  No plugin call hands this list out, so CTM asks a second, short-lived `claude` for it (the SDK's
+  `initialize` request: about 2 seconds, nothing is sent to a model, no tokens) and keeps the
+  answer for 15 minutes – a failed fetch too, so it does not wait again on every call.
+  Nothing is hard-coded: the list follows your account, policy and Claude Code version. Where that
+  does not work, it falls back to the bare choices of the `/config` Model row. Says so when a
+  policy locks the Model setting.
 - `mcp__ctm__switch_model` `{ model, resumePrompt, reset?, instructions? }` – schedules a model
   switch for the end of the current turn, e.g. to a smaller model for routine work or when the
   limits run high, or to a larger one for a hard problem. Rules:
@@ -89,10 +100,26 @@ The model gets this legend once, in the CTM part of its system prompt (cached).
   - If the switch itself then fails, the model stays as it was and the resume prompt arrives with
     the command that was run (`/model <name>`) and the engine's answer verbatim. If the reset
     fails, the switch is skipped too.
+  - Optional `effort`: sets the effort for the new model in the same go (after the switch;
+    checked against the levels the new model supports).
   - Main agent only; shares the `resetCooldownMinutes` gap with `reset`; dropped if you
     interrupt the turn.
+- `mcp__ctm__set_effort` `{ level, resumePrompt? }` – changes the model's own reasoning effort
+  (`low`, `medium`, `high`, `xhigh`, `max`, or `auto` to hand the choice back to Claude Code), e.g.
+  up when its solutions stay half-baked, down for routine work. Rules:
+  - Runs as `/effort <level>` at the end of the turn, **for this session only**; then the model
+    gets a message to carry on (its `resumePrompt`, or "carry on where you left off" – the
+    conversation stays as it is).
+  - Checked against the levels the current model supports; a refusal comes back with the command
+    and the engine's answer verbatim, the effort unchanged.
+  - If you told the model to keep a model or an effort level, it is told not to change it itself.
+  - Main agent only; its own gap between two effort changes (`effortCooldownMinutes`, independent
+    of the reset/switch gap); joins a reset or
+    model switch scheduled in the same turn; dropped if you interrupt the turn.
+  - The current effort is read from the model requests themselves (`turn.step`), so it is exact
+    after any change, yours included.
 
-You get a toast whenever the model schedules a reset or a model switch, turns idle updates on, changes the
+You get a toast whenever the model schedules a reset, a model switch or an effort change, turns idle updates on, changes the
 settings, or arms or fires a limit wake-up.
 
 ## Thresholds and wake-ups
@@ -144,7 +171,8 @@ The model is told when you change them.
 | `compactThreshold` | empty | `300k`, `30%`, `off`; empty = unset (the model is nudged to ask you) |
 | `fiveHourPauseAt` | 0 | Pause threshold for the 5-hour limit in percent, 0 = off |
 | `sevenDayPauseAt` | 0 | Pause threshold for the 7-day limit in percent, 0 = off |
-| `resetCooldownMinutes` | 10 | Minimum time between two compact/clear/model switches |
+| `resetCooldownMinutes` | 10 | Minimum time between two compact/clear/model switches (one shared gap), 0 = none |
+| `effortCooldownMinutes` | 10 | Minimum time between two effort changes, independent of the one above, 0 = none |
 | `attachToPrompts` | true | Attach the figures to your own prompts |
 | `timeZone` | empty | IANA zone for every time shown, e.g. `Europe/Berlin`. Empty = automatic: `TZ`, then `/etc/localtime` or `/etc/timezone`, then the system zone, else UTC |
 

@@ -12,8 +12,9 @@ import type { EngineInterface, Register } from 'claude-code'
 //    prompt, and a compact only with instructions for the summary.
 // 3. A short CTM briefing sits in the system prompt for good (it survives compact
 //    and clear) and is sent once more after every CTM reset.
-// 4. Lets the model see its own model and the models it can switch to, and switch
-//    (on its own or together with a compact or clear) – again with a resume prompt.
+// 4. Lets the model see its own model and effort and the models it can switch to (with
+//    the engine's own descriptions where it can get them), and switch model and/or
+//    effort (on its own or together with a compact or clear) – again with a resume prompt.
 // 5. Settings the model (`settings` tool) or the person (/ctm, userConfig) can set:
 //    the update interval, a compact threshold (the blocks remind the model to compact
 //    once the context passes it; while it is unset they remind it now and then to ask
@@ -26,9 +27,15 @@ import type { EngineInterface, Register } from 'claude-code'
 // this session; a reload of the mod starts it over.
 
 type Mode = 'compact' | 'clear'
-// What runs at the end of the turn: a compact or clear, a model switch, or both (the
-// reset first, so the new model only re-caches the smaller conversation).
-type PendingReset = { mode: Mode | null; model: string | null; instructions: string | null; resumePrompt: string }
+// What runs at the end of the turn, in this order: a compact or clear, a model switch,
+// an effort change (its levels depend on the model). Any of them may be left out.
+type PendingReset = {
+  mode: Mode | null
+  model: string | null
+  effort: string | null
+  instructions: string | null
+  resumePrompt: string
+}
 type IdleWatch = { until: number | null }
 type LimitReading = { percent: number; resetsAt: string | null }
 type Snapshot = {
@@ -53,6 +60,8 @@ const T_SETTINGS = 'mcp__ctm__settings'
 const T_WAKEUP = 'mcp__ctm__limit_wakeup'
 const T_MODELS = 'mcp__ctm__models'
 const T_SWITCH = 'mcp__ctm__switch_model'
+const T_EFFORT = 'mcp__ctm__set_effort'
+const EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max', 'auto']
 const STORE_SETTINGS = 'settings'
 const NAG_EVERY_MS = 30 * 60_000
 // Built-in safety net: this close to a limit the blocks always ask the model to pause,
@@ -67,6 +76,8 @@ const RESET_DELAY_MS = 1_000
 const COMPACT_CONFIRM_MS = 10 * 60_000
 const CLEAR_CONFIRM_MS = 2 * 60_000
 const CHECK_TIMEOUT_MS = 30_000
+const CATALOG_TIMEOUT_MS = 20_000
+const CATALOG_TTL_MS = 15 * 60_000
 
 const MINUTE = 60_000
 
@@ -74,6 +85,11 @@ const lastSent = new Map<string, number>() // recipient ('main' | agentId) -> la
 const previousReport = new Map<string, Snapshot>() // recipient -> snapshot of its last report
 let lastTurnEndAt = 0
 let lastResetAt = Number.NEGATIVE_INFINITY
+let lastEffortAt = Number.NEGATIVE_INFINITY
+let lastEffort: string | null = null // the main loop's effort, as its last model request carried it
+// The engine's model list, kept for CATALOG_TTL_MS – a failed fetch too, so a host where
+// it does not work is not asked again on every call.
+let catalog: { at: number; list: Promise<CatalogEntry[] | null> } | null = null
 let busy = false
 let idle: IdleWatch | null = null
 let pending: PendingReset | null = null
@@ -89,7 +105,8 @@ const watches = new Map<LimitKind, LimitWatch>()
 let configIntervalMinutes = 3
 let configCompactThreshold = ''
 let configPauseAt: Record<LimitKind, number> = { five_hour: 0, seven_day: 0 }
-let cooldownMs = 10 * MINUTE
+let cooldownMs = 10 * MINUTE // between two resets or model switches
+let effortCooldownMs = 10 * MINUTE // between two effort changes
 let attachToPrompts = true
 let configuredTimeZone = ''
 let timeZone: string | null = null // resolved on the first report
@@ -111,7 +128,9 @@ const INFO = [
   `- ${T_IDLE}: blocks while you are idle as well (each one starts a new turn and costs quota; use sparingly, with maxMinutes).`,
   `- ${T_RESET}: schedules a compact (summary; needs instructions) or a clear (everything gone) for the end of your turn, then sends you your resumePrompt so you carry on. The resumePrompt is what you can rely on afterwards: next step, key facts, and every important rule – no length limit, be complete; or write them to a file and give its exact path in the resumePrompt.`,
   'A good moment for compact/clear is right after finishing a sub-task, before the context gets tight – never in the middle of a change.',
-  `- ${T_MODELS}: your current model and the models you can switch to. ${T_SWITCH}: switches the model at the end of your turn – alone or together with a compact/clear (cheaper: the new model then re-caches only the smaller conversation) – and sends you your resumePrompt afterwards, as a reset does. Switch to a smaller model for simple, routine work, to a larger one for hard problems.`,
+  `- ${T_MODELS}: your current model and effort, and the models you can switch to with what each is good for. ${T_SWITCH}: switches the model at the end of your turn – alone or together with a compact/clear (cheaper: the new model then re-caches only the smaller conversation) – and sends you your resumePrompt afterwards, as a reset does. Switch to a smaller model for simple, routine work, to a larger one for hard problems.`,
+  `- ${T_EFFORT}: raises or lowers how long you think, from the end of your turn on, then you carry on. Raise it when your solutions stay half-baked or the problem is harder than it looked; lower it for routine work.`,
+  '- If the user told you to stay on a model or an effort level, do not change it yourself.',
   `- ${T_SETTINGS}: how often these blocks come (1–${MAX_INTERVAL_MINUTES} min), a compact threshold (tokens like 300k, or a % of the window), and pause thresholds for the 5-hour and 7-day limits. No arguments = show the current settings. Kept across sessions.`,
   '- Past the compact threshold the blocks remind you to compact: do it at the next clean point if your task allows it (a smaller context makes every further request cheaper on the limits) – never break off critical work for it.',
   '- Built-in safety net, always active and not configurable: from 95% of the 5-hour limit and 97% of the 7-day limit the blocks ask you to pause, even with no pause threshold set.',
@@ -537,34 +556,67 @@ async function report($: EngineInterface, reason: string, recipient = 'main'): P
 
 // ---------------------------------------------------------------- Models
 
-type ModelInfo = { current: string | null; setting: string | null; options: string[]; locked: boolean }
+type ModelInfo = {
+  current: string | null
+  effort: string | null
+  setting: string | null
+  options: string[]
+  catalog: CatalogEntry[] | null
+  locked: boolean
+}
 
 // The current model as /model shows it, and the choices of the /config Model row
 // (aliases; a full model id works as well). Each part is null/empty where the host
 // has nothing to say.
-async function modelInfo($: EngineInterface): Promise<ModelInfo> {
+async function modelInfo($: EngineInterface, withCatalog = true): Promise<ModelInfo> {
   const current = (await safe(() => $.session.model())) ?? null
   const row = (await safe(() => $.config.list()))?.find(r => r.key === 'model')
+  const cat = withCatalog ? await getCatalog($) : null
+  const options = [...(row?.options ?? [])]
+  for (const c of cat ?? []) if (!options.includes(c.value)) options.push(c.value)
   return {
     current,
+    effort: await currentEffort($),
     setting: row?.value === undefined ? null : String(row.value),
-    options: [...(row?.options ?? [])],
+    options,
+    catalog: cat,
     locked: (row as { isLocked?: boolean } | undefined)?.isLocked === true,
   }
 }
 
+function fmtLevels(levels: string[] | undefined): string {
+  if (!levels || levels.length === 0) return 'no effort levels'
+  return levels.length > 2 ? `effort ${levels[0]}–${levels[levels.length - 1]}` : `effort ${levels.join('/')}`
+}
+
 function describeModels(m: ModelInfo): string {
-  const lines = ['CTM models:', `- Current model (main agent): ${m.current ?? 'unknown'}`]
+  const lines = [
+    'CTM models:',
+    `- Current model (main agent): ${m.current ?? 'unknown'}`,
+    `- Current effort: ${m.effort ?? 'unknown (the model may have no effort levels)'}`,
+  ]
   if (m.setting !== null) lines.push(`- Model setting: ${m.setting}`)
-  lines.push(
-    m.options.length > 0
-      ? `- Available: ${m.options.join(', ')} – or a full model ID (e.g. claude-…).`
-      : '- Available: the host lists none; aliases like sonnet, opus, haiku or a full model ID usually work.',
-  )
+  if (m.catalog) {
+    lines.push('- Available (alias → model: what it is good for), as Claude Code describes them:')
+    for (const c of m.catalog) {
+      const extras = [fmtLevels(c.supportedEffortLevels), c.supportsFastMode ? 'fast mode' : null].filter(Boolean)
+      const target = c.resolvedModel && c.resolvedModel !== c.value ? ` → ${c.resolvedModel}` : ''
+      lines.push(`  - ${c.value}${target}: ${c.description ?? c.displayName ?? ''} (${extras.join(', ')})`)
+    }
+    const more = m.options.filter(o => !m.catalog!.some(c => c.value === o))
+    lines.push(`  Also accepted: ${more.length > 0 ? `${more.join(', ')}, ` : ''}or a full model ID (e.g. claude-…).`)
+  } else {
+    lines.push(
+      m.options.length > 0
+        ? `- Available: ${m.options.join(', ')} – or a full model ID (e.g. claude-…).`
+        : '- Available: the host lists none; aliases like sonnet, opus, haiku or a full model ID usually work.',
+    )
+  }
   if (m.locked) lines.push('- The Model setting is locked by a policy: a switch may be refused.')
   lines.push(
     `Switch with ${T_SWITCH} (at the end of your turn, with a resumePrompt). It is for this session only; the ` +
-      'prompt cache is rebuilt on the new model, so combine it with a compact or clear when the context is large.',
+      'prompt cache is rebuilt on the new model, so combine it with a compact or clear when the context is large. ' +
+      `Effort: ${T_EFFORT}.`,
   )
   return lines.join('\n')
 }
@@ -572,6 +624,61 @@ function describeModels(m: ModelInfo): string {
 // A model id or alias: no spaces, nothing odd. The engine decides whether it exists.
 function isModelName(s: string): boolean {
   return /^[A-Za-z0-9][\w.:\/@-]*(\[\w+\])?$/.test(s) && s.length <= 200
+}
+
+// The engine's own model list, as the /model picker shows it: alias, the model it
+// stands for, a line on what it is good for, its effort levels. No plugin call hands
+// it out, so CTM asks a second, short-lived `claude` for it – the SDK's initialize
+// request, which sends nothing to a model and costs no tokens (about 2 s). Kept for
+// 15 minutes; null where that does not work (the list falls back to the bare aliases).
+type CatalogEntry = {
+  value: string
+  resolvedModel?: string
+  displayName?: string
+  description?: string
+  supportedEffortLevels?: string[]
+  supportsFastMode?: boolean
+}
+
+async function fetchCatalog($: EngineInterface): Promise<CatalogEntry[] | null> {
+  const exe = (await safe(() => $.env.get('CLAUDE_CODE_EXECPATH'))) || 'claude'
+  const r = await safe(() =>
+    $.process.run(
+      [exe, '-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose', '--no-session-persistence'],
+      {
+        stdin: `${JSON.stringify({ type: 'control_request', request_id: 'ctm', request: { subtype: 'initialize' } })}\n`,
+        timeoutMs: CATALOG_TIMEOUT_MS,
+      },
+    ),
+  )
+  return r ? parseCatalog(r.stdout) : null
+}
+
+function parseCatalog(stdout: string): CatalogEntry[] | null {
+  for (const line of stdout.split('\n')) {
+    if (!line.includes('"control_response"')) continue
+    try {
+      const models = JSON.parse(line)?.response?.response?.models
+      if (!Array.isArray(models)) continue
+      const entries = models.filter(m => m && typeof m.value === 'string') as CatalogEntry[]
+      return entries.length > 0 ? entries : null
+    } catch {
+      // not the line we are after
+    }
+  }
+  return null
+}
+
+async function getCatalog($: EngineInterface): Promise<CatalogEntry[] | null> {
+  const now = await $.clock.now()
+  if (!catalog || now - catalog.at >= CATALOG_TTL_MS) catalog = { at: now, list: fetchCatalog($) }
+  return catalog.list
+}
+
+// The current effort: what the main loop's last request carried; before the first
+// one, the level the session started with.
+async function currentEffort($: EngineInterface): Promise<string | null> {
+  return lastEffort ?? ((await safe(() => $.env.get('CLAUDE_EFFORT'))) || null)
 }
 
 // Does the model exist and may this session use it? Aliases the host lists exist; any
@@ -621,17 +728,45 @@ async function switchModel($: EngineInterface, model: string): Promise<{ ok: boo
   }
 }
 
+// Sets the effort through /effort <level> – for this session only – and checks the
+// answer: "Set effort level to …" / "Effort level set to …" on success.
+async function setEffort($: EngineInterface, level: string): Promise<{ ok: boolean; note: string }> {
+  const before = await currentEffort($)
+  let text = ''
+  try {
+    const r = await $.command.run({ command: 'effort', args: level })
+    refusedBy(r)
+    text = (r.text ?? '').trim()
+  } catch (err) {
+    text = errorText(err)
+  }
+  if (/^(set effort level to|effort level set to)\b/i.test(text)) {
+    if (level !== 'auto') lastEffort = level
+    else lastEffort = null
+    return { ok: true, note: `[CTM] Your effort was set as you scheduled: now ${level}${before && before !== level ? ` (was ${before})` : ''}.` }
+  }
+  return {
+    ok: false,
+    note:
+      `[CTM] The effort change to "${level}" you scheduled failed. Command: /effort ${level} – the engine answered: ` +
+      `${text ? `"${text}"` : 'nothing'}. Your effort is unchanged${before ? ` (${before})` : ''}.`,
+  }
+}
+
 // ---------------------------------------------------------------- Reset (runs after the turn)
 
-function describeJob(job: { mode: Mode | null; model: string | null }): string {
-  return [job.mode, job.model ? `model switch to ${job.model}` : null].filter(Boolean).join(' + ')
+function describeJob(job: { mode: Mode | null; model: string | null; effort: string | null }): string {
+  return [job.mode, job.model ? `model switch to ${job.model}` : null, job.effort ? `effort ${job.effort}` : null]
+    .filter(Boolean)
+    .join(' + ')
 }
 
 async function resetMessage($: EngineInterface, job: PendingReset, note: string): Promise<string> {
   const model = (await safe(() => $.session.model())) ?? null
+  const effort = await currentEffort($)
   return [
     note,
-    ...(model ? [`Current model: ${model}`] : []),
+    ...(model ? [`Current model: ${model}${effort ? `, effort ${effort}` : ''}`] : []),
     '',
     INFO,
     '',
@@ -673,8 +808,14 @@ async function deliverResume($: EngineInterface, job: PendingReset, note: string
     if (!sw.ok) toast($, `CTM: model switch failed – ${job.model}`)
     note = note ? `${note}\n${sw.note}` : sw.note
   }
+  if (job.effort) {
+    const ef = await setEffort($, job.effort)
+    if (!ef.ok) toast($, `CTM: effort change failed – ${job.effort}`)
+    note = note ? `${note}\n${ef.note}` : ef.note
+  }
   const now = await $.clock.now()
-  lastResetAt = now
+  if (job.mode || job.model) lastResetAt = now
+  if (job.effort) lastEffortAt = now
   lastSent.set('main', now)
   await $.prompt.submit({ text: await resetMessage($, job, note) })
 }
@@ -684,7 +825,10 @@ async function failReset($: EngineInterface, job: PendingReset, message: string)
   awaitTimer?.cancel()
   awaitTimer = null
   toast($, `CTM: ${job.mode} failed – ${message}`)
-  const skipped = job.model ? ` The model switch to "${job.model}" was skipped as well.` : ''
+  const rest = [job.model ? `model switch to "${job.model}"` : null, job.effort ? `effort change to "${job.effort}"` : null]
+    .filter(Boolean)
+    .join(' and ')
+  const skipped = rest ? ` The ${rest} was skipped as well.` : ''
   await $.prompt.submit({
     text: `[CTM] The ${job.mode} you scheduled failed (${message}). The conversation is unchanged; carry on as usual.${skipped}\n\n--- Your resume prompt ---\n${job.resumePrompt}`,
   })
@@ -711,7 +855,7 @@ async function runReset($: EngineInterface): Promise<void> {
   if (busy) return // a new turn is already running: try again at its turn.complete
   pending = null
 
-  if (job.mode === null) return deliverResume($, job, '') // a model switch alone
+  if (job.mode === null) return deliverResume($, job, '') // a model and/or effort change alone
   if (job.mode === 'clear') return runAsCommand($, { ...job, mode: job.mode })
 
   try {
@@ -795,6 +939,7 @@ export const register: Register = (on, options) => {
   lastWatchCheckAt = 0
   watches.clear()
   cooldownMs = Math.max(0, Number(options.resetCooldownMinutes ?? 10)) * MINUTE
+  effortCooldownMs = Math.max(0, Number(options.effortCooldownMinutes ?? 10)) * MINUTE
   attachToPrompts = options.attachToPrompts !== false
   configuredTimeZone = String(options.timeZone ?? '')
   timeZone = null
@@ -946,6 +1091,8 @@ export const register: Register = (on, options) => {
         'combine it with reset "compact" (needs instructions) or "clear": the reset runs first, then the switch.\n' +
         '- If the host or a policy refuses the model, you stay on the current one and are told why, with your ' +
         'resumePrompt.\n' +
+        `- Optional effort: set the effort for the new model in the same go (see ${T_EFFORT}).\n` +
+        '- If the user told you to stay on a model, do not switch on your own.\n' +
         'Write the resumePrompt as for a reset: 1. next step, 2. key facts, 3. every important rule – no length ' +
         'limit; or the next step plus the exact path of a file holding the rest. ' +
         `Shares the ${cooldownMs / MINUTE}-minute minimum gap with ${T_RESET}. Main agent only.`,
@@ -968,8 +1115,41 @@ export const register: Register = (on, options) => {
             type: 'string',
             description: 'Required with reset "compact": what the summary must keep.',
           },
+          effort: {
+            type: 'string',
+            enum: EFFORT_LEVELS,
+            description: 'Optional: the effort level to set after the switch.',
+          },
         },
         required: ['model', 'resumePrompt'],
+        additionalProperties: false,
+      },
+      isDeferred: false,
+    })
+    await $.tool.register({
+      name: 'set_effort',
+      description:
+        'CTM: Changes how long you think (your reasoning effort) from the END of your current turn on – for this ' +
+        'session only – then you automatically get a message and carry on (with resumePrompt if you give one). ' +
+        'Finish your answer promptly after calling this. ' +
+        `See ${T_MODELS} for your current effort and the levels your model supports.\n` +
+        '- Raise it (high, xhigh, max) when your solutions stay half-baked, you keep going in circles, or the ' +
+        'problem turns out harder than it looked. Lower it (low, medium) for simple, routine work – it saves time ' +
+        'and quota. "auto" hands the choice back to Claude Code.\n' +
+        '- If the user told you to keep a certain effort, do not change it on your own.\n' +
+        `At least ${effortCooldownMs / MINUTE} minutes between two effort changes. Main agent only.`,
+      inputSchema: {
+        type: 'object',
+        properties: {
+          level: { type: 'string', enum: EFFORT_LEVELS },
+          resumePrompt: {
+            type: 'string',
+            description:
+              'Optional: what to continue with once the new effort is in place. Your conversation stays as it is, ' +
+              'so the next step is enough. Left out: you are told to carry on where you left off.',
+          },
+        },
+        required: ['level'],
         additionalProperties: false,
       },
       isDeferred: false,
@@ -1116,7 +1296,7 @@ export const register: Register = (on, options) => {
     if (wait > 0) return { deny: `CTM: the last reset was too recent. Next one possible ${fmtIn(wait)}.` }
 
     const replaced = pending !== null
-    pending = { mode, model: null, instructions: mode === 'compact' ? instructions : null, resumePrompt }
+    pending = { mode, model: null, effort: null, instructions: mode === 'compact' ? instructions : null, resumePrompt }
     toast($, `CTM: the model scheduled a ${mode} for the end of this turn`)
     return {
       result:
@@ -1179,11 +1359,15 @@ export const register: Register = (on, options) => {
 
   on('tool.call', { tool: T_SWITCH }, async ($, e) => {
     if (e.agentId) return { deny: 'CTM: only the main agent may switch the model.' }
-    const input = e as unknown as { model?: unknown; resumePrompt?: unknown; reset?: unknown; instructions?: unknown }
+    const input = e as unknown as { model?: unknown; resumePrompt?: unknown; reset?: unknown; instructions?: unknown; effort?: unknown }
     const model = typeof input.model === 'string' ? input.model.trim() : ''
     if (!isModelName(model)) return { deny: `CTM: "model" must be an alias or a full model ID (see ${T_MODELS}).` }
     const mode = input.reset ?? null
     if (mode !== null && mode !== 'compact' && mode !== 'clear') return { deny: 'CTM: "reset" must be "compact", "clear" or left out.' }
+    const effort = input.effort ?? null
+    if (effort !== null && (typeof effort !== 'string' || !EFFORT_LEVELS.includes(effort))) {
+      return { deny: `CTM: "effort" must be one of ${EFFORT_LEVELS.join(', ')} or left out.` }
+    }
     const resumePrompt = typeof input.resumePrompt === 'string' ? input.resumePrompt.trim() : ''
     if (resumePrompt.length < MIN_RESUME_CHARS) {
       return { deny: `CTM: no model switch without a meaningful resumePrompt (at least ${MIN_RESUME_CHARS} characters).` }
@@ -1210,7 +1394,13 @@ export const register: Register = (on, options) => {
     }
 
     const replaced = pending !== null
-    pending = { mode, model, instructions: mode === 'compact' ? instructions : null, resumePrompt }
+    const target = info.catalog?.find(c => c.value === model || c.resolvedModel === model)
+    if (effort && effort !== 'auto' && target?.supportedEffortLevels && !target.supportedEffortLevels.includes(effort)) {
+      return {
+        deny: `CTM: ${model} does not support effort "${effort}" (it supports ${target.supportedEffortLevels.join(', ')}) – nothing was scheduled.`,
+      }
+    }
+    pending = { mode, model, effort, instructions: mode === 'compact' ? instructions : null, resumePrompt }
     toast($, `CTM: the model scheduled a ${describeJob(pending)} for the end of this turn`)
     return {
       result:
@@ -1221,6 +1411,50 @@ export const register: Register = (on, options) => {
         'Finish your answer now; you will then receive your resume prompt.',
     }
   }).catch(() => ({ deny: 'CTM: could not schedule the model switch.' }))
+
+  on('tool.call', { tool: T_EFFORT }, async ($, e) => {
+    if (e.agentId) return { deny: 'CTM: only the main agent may change its effort.' }
+    const input = e as unknown as { level?: unknown; resumePrompt?: unknown }
+    const level = input.level
+    if (typeof level !== 'string' || !EFFORT_LEVELS.includes(level)) {
+      return { deny: `CTM: "level" must be one of ${EFFORT_LEVELS.join(', ')}.` }
+    }
+    const now = await $.clock.now()
+    const wait = lastEffortAt + effortCooldownMs - now
+    if (wait > 0) return { deny: `CTM: the last effort change was too recent. Next one possible ${fmtIn(wait)}.` }
+
+    const info = await modelInfo($)
+    const own = info.catalog?.find(c => c.resolvedModel === info.current) ?? info.catalog?.find(c => c.value === info.current)
+    if (level !== 'auto' && own?.supportedEffortLevels && !own.supportedEffortLevels.includes(level)) {
+      return {
+        deny: `CTM: your model ${info.current} does not support effort "${level}" (it supports ${own.supportedEffortLevels.join(', ')}).`,
+      }
+    }
+    if (own && (!own.supportedEffortLevels || own.supportedEffortLevels.length === 0)) {
+      return { deny: `CTM: your model ${info.current} has no effort levels.` }
+    }
+    const given = typeof input.resumePrompt === 'string' ? input.resumePrompt.trim() : ''
+    const resumePrompt = given || 'Carry on with your task where you left off, now with the new effort.'
+
+    const replaced = pending !== null
+    // Joins a reset or model switch already scheduled for this turn; else stands alone.
+    pending = pending
+      ? { ...pending, effort: level, resumePrompt: given ? `${pending.resumePrompt}\n\n${given}` : pending.resumePrompt }
+      : { mode: null, model: null, effort: level, instructions: null, resumePrompt }
+    toast($, `CTM: the model scheduled effort ${level} for the end of this turn`)
+    return {
+      result:
+        `CTM: effort ${level} scheduled for the end of this turn (now ${info.effort ?? 'unknown'})` +
+        `${replaced ? '; added to the reset or switch already scheduled' : ''}. ` +
+        'Finish your answer now; you will then get a message to carry on.',
+    }
+  }).catch(() => ({ deny: 'CTM: could not schedule the effort change.' }))
+
+  // The main loop's effort, as each of its model requests carries it.
+  on('turn.step', async function* ($, e, next) {
+    if (!e.agentId && e.effort !== undefined) lastEffort = String(e.effort)
+    return yield* next(e)
+  })
 
   // ---------------------------------------------------------------- Figures while working
 

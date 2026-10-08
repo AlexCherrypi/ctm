@@ -26,7 +26,30 @@ const MODEL_IDS: Record<string, string> = {
   'claude-haiku-5-5': 'claude-haiku-5-5',
 }
 
-function world(on: On, initial: Usage = USAGE, opts: { headless?: boolean; lockedModel?: boolean; refuseModel?: string; blockedModel?: string } = {}) {
+const LEVELS = ['low', 'medium', 'high', 'xhigh', 'max']
+// The engine's model list as a second `claude` answers the SDK's initialize request.
+const CATALOG = [
+  { value: 'default', resolvedModel: 'claude-sonnet-5-5', displayName: 'Default (recommended)', description: 'Sonnet 5.5 · Efficient for routine tasks', supportedEffortLevels: LEVELS },
+  { value: 'opus', resolvedModel: 'claude-opus-5-5', displayName: 'Opus', description: 'Opus 5.5 · Best for everyday, complex tasks', supportedEffortLevels: LEVELS, supportsFastMode: true },
+  { value: 'haiku', resolvedModel: 'claude-haiku-5-5', displayName: 'Haiku', description: 'Haiku 5.5 · Fastest for quick answers', supportedEffortLevels: ['low', 'medium', 'high'] },
+]
+const INIT_STDOUT = [
+  JSON.stringify({ type: 'system', subtype: 'ui_status', text: 'x' }),
+  JSON.stringify({ type: 'control_response', response: { subtype: 'success', request_id: 'ctm', response: { models: CATALOG } } }),
+  '',
+].join('\n')
+
+type WorldOpts = {
+  headless?: boolean
+  lockedModel?: boolean
+  refuseModel?: string
+  blockedModel?: string
+  catalog?: boolean
+  refuseEffort?: string
+  effort?: string
+}
+
+function world(on: On, initial: Usage = USAGE, opts: WorldOpts = {}) {
   const usage = { current: initial }
   const model = { current: 'claude-opus-5-5' }
   const seen = {
@@ -37,7 +60,15 @@ function world(on: On, initial: Usage = USAGE, opts: { headless?: boolean; locke
     usage,
     model,
     checks: [] as string[],
+    spawns: [] as string[][],
   }
+  on('process.run', (_$, e) => {
+    const argv = (e as unknown as { argv: string[] }).argv
+    seen.spawns.push(argv)
+    return { value: { exitCode: opts.catalog ? 0 : 1, stdout: opts.catalog ? INIT_STDOUT : '', stderr: '' } } as never
+  })
+  // The effort the session started with (CLAUDE_EFFORT); left out, the time tests own env.get.
+  if (opts.effort) on('env.get', (_$, e) => ({ value: (e as unknown as { name: string }).name === 'CLAUDE_EFFORT' ? opts.effort : undefined }) as never)
   on('session.model', () => ({ value: model.current }) as never)
   // The existence check: a one-token request; 404 for a name the API does not know.
   on('model.complete', (_$, e) => {
@@ -79,6 +110,10 @@ function world(on: On, initial: Usage = USAGE, opts: { headless?: boolean; locke
   })
   on('command.run', (_$, e) => {
     seen.commands.push(e.args ? `${e.command} ${e.args}` : e.command)
+    if (e.command === 'effort') {
+      if (opts.refuseEffort) return { text: opts.refuseEffort }
+      return { text: `Set effort level to ${e.args} (this session only): …` }
+    }
     if (e.command === 'model') {
       // As /model answers: an unknown name or a policy refusal leaves the model as it was.
       if (opts.refuseModel) return { text: opts.refuseModel }
@@ -735,6 +770,7 @@ describe('built-in safety threshold', () => {
 describe('models', () => {
   test('shows the current model and the available ones', async ($, on) => {
     world(on)
+    mock.clock(on, { now: 1_000_000 })
     const r = String((await $.tool.call({ tool: 'mcp__ctm__models' } as never)).result)
     expect(r).toContain('Current model (main agent): claude-opus-5-5')
     expect(r).toContain('Available: default, sonnet, opus, haiku, sonnet[1m], opus[1m] – or a full model ID')
@@ -743,6 +779,7 @@ describe('models', () => {
 
   test('says when a policy locks the Model setting', async ($, on) => {
     world(on, USAGE, { lockedModel: true })
+    mock.clock(on, { now: 1_000_000 })
     const r = String((await $.tool.call({ tool: 'mcp__ctm__models' } as never)).result)
     expect(r).toContain('locked by a policy')
   })
@@ -910,5 +947,137 @@ describe('switch_model', () => {
     await clock.advance(2_000)
     expect(seen.commands).toEqual([])
     expect(seen.prompts).toEqual([])
+  })
+})
+
+describe('model catalog', () => {
+  test('lists each model with what it is good for, its target and effort levels', async ($, on) => {
+    const seen = world(on, USAGE, { catalog: true, effort: 'medium' })
+    mock.clock(on, { now: 1_000_000 })
+    const r = String((await $.tool.call({ tool: 'mcp__ctm__models' } as never)).result)
+    expect(r).toContain('- Current effort: medium')
+    expect(r).toContain('  - opus → claude-opus-5-5: Opus 5.5 · Best for everyday, complex tasks (effort low–max, fast mode)')
+    expect(r).toContain('  - haiku → claude-haiku-5-5: Haiku 5.5 · Fastest for quick answers (effort low–high)')
+    expect(r).toContain('  - default → claude-sonnet-5-5: Sonnet 5.5 · Efficient for routine tasks')
+    expect(r).toContain('  Also accepted: sonnet, sonnet[1m], opus[1m], or a full model ID')
+    expect(seen.spawns[0]).toContain('--input-format')
+
+    await $.tool.call({ tool: 'mcp__ctm__models' } as never)
+    expect(seen.spawns.length).toBe(1) // cached
+  })
+
+  test('is kept for 15 minutes, then fetched again', async ($, on) => {
+    const seen = world(on, USAGE, { catalog: true })
+    const clock = mock.clock(on, { now: 1_000_000 })
+    await $.tool.call({ tool: 'mcp__ctm__models' } as never)
+    await clock.advance(14 * 60_000)
+    await $.tool.call({ tool: 'mcp__ctm__models' } as never)
+    expect(seen.spawns.length).toBe(1)
+    await clock.advance(60_000)
+    await $.tool.call({ tool: 'mcp__ctm__models' } as never)
+    expect(seen.spawns.length).toBe(2)
+  })
+
+  test('without the catalog it falls back to the bare list, and does not retry on every call', async ($, on) => {
+    const seen = world(on)
+    mock.clock(on, { now: 1_000_000 })
+    const r = String((await $.tool.call({ tool: 'mcp__ctm__models' } as never)).result)
+    expect(r).toContain('- Available: default, sonnet, opus, haiku')
+    expect(r).not.toContain('good for')
+    await $.tool.call({ tool: 'mcp__ctm__models' } as never)
+    expect(seen.spawns.length).toBe(1)
+  })
+
+  test('an alias only the catalog lists needs no test request', async ($, on) => {
+    const seen = world(on, USAGE, { catalog: true })
+    mock.clock(on, { now: 1_000_000 })
+    expect((await $.tool.call({ tool: 'mcp__ctm__switch_model', model: 'haiku', resumePrompt: RESUME } as never)).deny).toBeUndefined()
+    expect(seen.checks).toEqual([])
+  })
+})
+
+describe('set_effort', () => {
+  const ef = (extra: Record<string, unknown>) => ({ tool: 'mcp__ctm__set_effort', ...extra }) as never
+
+  test('refuses a level that is none, subagents, and a level the model does not support', async ($, on) => {
+    world(on, USAGE, { catalog: true })
+    mock.clock(on, { now: 1_000_000 })
+    expect((await $.tool.call(ef({ level: 'ultra' }))).deny).toMatch(/"level" must be one of low, medium, high, xhigh, max, auto/)
+    expect((await $.tool.call(ef({ level: 'high', agentId: 'sub-1' }))).deny).toMatch(/main agent/)
+  })
+
+  test('sets the effort after the turn through /effort and tells the model to carry on', async ($, on) => {
+    const seen = world(on, USAGE, { effort: 'medium' })
+    const clock = mock.clock(on, { now: 1_000_000 })
+    on('turn.complete', () => ({ text: '' }) as never)
+
+    const r = await $.tool.call(ef({ level: 'xhigh' }))
+    expect(String(r.result)).toContain('effort xhigh scheduled for the end of this turn (now medium)')
+    await $.turn.complete(turn)
+    await clock.advance(2_000)
+
+    expect(seen.commands).toEqual(['effort xhigh'])
+    expect(seen.prompts.length).toBe(1)
+    expect(seen.prompts[0]).toContain('[CTM] Your effort was set as you scheduled: now xhigh (was medium).')
+    expect(seen.prompts[0]).toContain('Current model: claude-opus-5-5, effort xhigh')
+    expect(seen.prompts[0]).toContain('Carry on with your task where you left off')
+
+    // its own cooldown – a model switch is still possible
+    expect((await $.tool.call(ef({ level: 'max' }))).deny).toMatch(/last effort change was too recent/)
+    expect((await $.tool.call({ tool: 'mcp__ctm__switch_model', model: 'haiku', resumePrompt: RESUME } as never)).deny).toBeUndefined()
+  })
+
+  test('a refused effort keeps the level and names the command and the answer', async ($, on) => {
+    const seen = world(on, USAGE, { refuseEffort: 'Invalid argument: max. Not allowed here', effort: 'medium' })
+    const clock = mock.clock(on, { now: 1_000_000 })
+    on('turn.complete', () => ({ text: '' }) as never)
+    await $.tool.call(ef({ level: 'max', resumePrompt: 'Next step: rerun the failing test.' }))
+    await $.turn.complete(turn)
+    await clock.advance(2_000)
+    expect(seen.prompts[0]).toContain(
+      '[CTM] The effort change to "max" you scheduled failed. Command: /effort max – the engine answered: "Invalid argument: max. Not allowed here". Your effort is unchanged (medium).',
+    )
+    expect(seen.prompts[0]).toContain('Next step: rerun the failing test.')
+  })
+
+  test('switch_model can set the effort for the new model in the same go, model first', async ($, on) => {
+    const seen = world(on, USAGE, { catalog: true, effort: 'medium' })
+    const clock = mock.clock(on, { now: 1_000_000 })
+    on('turn.complete', () => ({ text: '' }) as never)
+
+    const bad = await $.tool.call({ tool: 'mcp__ctm__switch_model', model: 'haiku', effort: 'max', resumePrompt: RESUME } as never)
+    expect(bad.deny).toContain('haiku does not support effort "max" (it supports low, medium, high)')
+
+    await $.tool.call({ tool: 'mcp__ctm__switch_model', model: 'haiku', effort: 'low', resumePrompt: RESUME } as never)
+    await $.turn.complete(turn)
+    await clock.advance(2_000)
+    expect(seen.commands).toEqual(['model haiku', 'effort low'])
+    expect(seen.prompts[0]).toContain('now claude-haiku-5-5 (was claude-opus-5-5)')
+    expect(seen.prompts[0]).toContain('now low (was medium)')
+    expect(seen.prompts[0]).toContain('after model switch to haiku + effort low')
+  })
+})
+
+describe('cooldowns', () => {
+  test('the effort gap is its own option, independent of the reset gap', { options: { effortCooldownMinutes: 2, resetCooldownMinutes: 30 } }, async ($, on) => {
+    world(on)
+    const clock = mock.clock(on, { now: 1_000_000 })
+    on('turn.complete', () => ({ text: '' }) as never)
+    await $.tool.call({ tool: 'mcp__ctm__set_effort', level: 'high' } as never)
+    await $.turn.complete(turn)
+    await clock.advance(2_000)
+    expect((await $.tool.call({ tool: 'mcp__ctm__set_effort', level: 'max' } as never)).deny).toMatch(/too recent/)
+    await clock.advance(2 * 60_000)
+    expect((await $.tool.call({ tool: 'mcp__ctm__set_effort', level: 'max' } as never)).deny).toBeUndefined()
+  })
+
+  test('0 turns the effort gap off', { options: { effortCooldownMinutes: 0 } }, async ($, on) => {
+    world(on)
+    const clock = mock.clock(on, { now: 1_000_000 })
+    on('turn.complete', () => ({ text: '' }) as never)
+    await $.tool.call({ tool: 'mcp__ctm__set_effort', level: 'high' } as never)
+    await $.turn.complete(turn)
+    await clock.advance(2_000)
+    expect((await $.tool.call({ tool: 'mcp__ctm__set_effort', level: 'max' } as never)).deny).toBeUndefined()
   })
 })

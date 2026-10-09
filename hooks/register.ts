@@ -50,7 +50,9 @@ type Settings = {
   compactThreshold?: string // "300k", "300000", "30%" or "off"
   pauseAt?: Partial<Record<LimitKind, number>> // percent; 0 = off
 }
-type LimitWatch = { kind: LimitKind; below: number; note: string }
+// resetsAt: the window's last known reset (ms) – the host can drop a limit from its
+// readings once that window has ended, and no new reading comes while the model pauses.
+type LimitWatch = { kind: LimitKind; below: number; note: string; resetsAt: number | null }
 
 const PREFIX = 'mcp__ctm__'
 const T_STATUS = 'mcp__ctm__status'
@@ -538,7 +540,13 @@ async function report($: EngineInterface, reason: string, recipient = 'main'): P
   }
   for (const w of watches.values()) {
     if (!notes.some(n => n.startsWith(limitName(w.kind)))) {
-      notes.push(`Wake-up armed: ${limitName(w.kind)} below ${fmtPercent(w.below)}.`)
+      const gone = !u.rateLimits.some(r => r.kind === w.kind)
+      notes.push(
+        `Wake-up armed: ${limitName(w.kind)} below ${fmtPercent(w.below)}` +
+          (gone && w.resetsAt !== null
+            ? ` (no current reading; its window ${w.resetsAt <= now ? 'reset' : 'resets'} ${fmtAt(w.resetsAt, now)}).`
+            : '.'),
+      )
     }
   }
   for (const n of notes) lines.push(`⚑ ${n}`)
@@ -894,9 +902,12 @@ async function idleTick($: EngineInterface): Promise<void> {
 // ---------------------------------------------------------------- Limit wake-ups
 
 // Is the limit back below the watch's mark? A reading from before its window's reset
-// counts as below: no new reading comes while the model pauses.
+// counts as below: no new reading comes while the model pauses. So does no reading at
+// all once the reset the watch knows of has passed – the host drops a limit whose
+// window has ended.
 function watchMet(w: LimitWatch, r: { percentUsed: number; resetsAt?: string } | undefined, now: number): string | null {
-  if (!r) return null
+  if (!r) return w.resetsAt !== null && w.resetsAt <= now ? `its window reset ${fmtAt(w.resetsAt, now)}` : null
+  if (r.resetsAt) w.resetsAt = Date.parse(r.resetsAt)
   if (readingIsStale(r, now)) return `its window reset ${fmtAt(Date.parse(r.resetsAt as string), now)}`
   if (r.percentUsed < w.below) return `it is at ${fmtPercent(r.percentUsed)}`
   return null
@@ -1334,10 +1345,15 @@ export const register: Register = (on, options) => {
     const below =
       typeof input.belowPercent === 'number' ? input.belowPercent : pauseAt(kind) > 0 ? pauseAt(kind) : FALLBACK_PAUSE_AT[kind]
     if (!(below > 0 && below <= 100)) return { deny: 'CTM: belowPercent must be from 1 to 100.' }
-    const watch: LimitWatch = { kind, below, note: typeof input.note === 'string' ? input.note.trim() : '' }
     const now = await $.clock.now()
     const u = await $.session.usage({ breakdown: 'summary' })
     const r = u.rateLimits.find(x => x.kind === kind)
+    const watch: LimitWatch = {
+      kind,
+      below,
+      note: typeof input.note === 'string' ? input.note.trim() : '',
+      resetsAt: r?.resetsAt ? Date.parse(r.resetsAt) : null,
+    }
     if (!r) return { deny: `CTM: no reading for the ${limitName(kind)} (not on a subscription, or no response yet).` }
     const already = watchMet(watch, r, now)
     if (already) return { result: `CTM: no need to wait – the ${limitName(kind)} is below ${fmtPercent(below)} already (${already}).` }

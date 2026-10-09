@@ -654,6 +654,23 @@ describe('limit pause and wake-up', () => {
     expect(seen.prompts).toHaveLength(1)
   })
 
+  test('wakes the model when the limit vanishes from the readings after its window reset', async ($, on) => {
+    const seen = world(on, HIGH)
+    mock.store(on, { settings: { compactThreshold: 'off', pauseAt: { five_hour: 50 } } })
+    const clock = mock.clock(on, { now: Date.parse('2026-10-08T09:00:00.000Z') })
+    on('session.start', () => ({ cwd: '/' }) as never)
+    await $.session.start({ cwd: '/' } as never)
+    await $.tool.call({ tool: 'mcp__ctm__limit_wakeup', limit: 'five_hour', note: 'Go on.' } as never)
+    seen.usage.current = { ...HIGH, rateLimits: [HIGH.rateLimits[1]!] } // the host drops the 5-hour limit
+    await clock.advance(60 * 60_000)
+    expect(seen.prompts).toHaveLength(0)
+    expect(await status($)).toMatch(/Wake-up armed: 5-hour limit below 50% \(no current reading; its window resets at 11:00\)/)
+    await clock.advance(61 * 60_000) // past 11:00
+    expect(seen.prompts).toHaveLength(1)
+    expect(seen.prompts[0]).toMatch(/Limit wake-up: the 5-hour limit is below 50% again \(its window reset at 11:00\)/)
+    expect(seen.prompts[0]).toContain('Go on.')
+  })
+
   test('wakes the model once usage drops below the mark', async ($, on) => {
     const seen = world(on, HIGH)
     mock.store(on)

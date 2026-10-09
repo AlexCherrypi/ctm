@@ -49,7 +49,6 @@ type Settings = {
   intervalMinutes?: number
   compactThreshold?: string // "300k", "300000", "30%" or "off"
   pauseAt?: Partial<Record<LimitKind, number>> // percent; 0 = off
-  holdTools?: boolean // hold every tool call past a pause mark
 }
 // resetsAt: the window's last known reset (ms) – the host can drop a limit from its
 // readings once that window has ended, and no new reading comes while the model pauses.
@@ -71,8 +70,8 @@ const NAG_EVERY_MS = 30 * 60_000
 // whatever is configured. Not a setting.
 const FALLBACK_PAUSE_AT: Record<LimitKind, number> = { five_hour: 95, seven_day: 97 }
 const MAX_INTERVAL_MINUTES = 60
-// A held tool call checks the limits again after each step.
-const HOLD_STEP_MS = 4_000
+// A subagent waiting in limit_wakeup checks the limits again after each step.
+const WAIT_STEP_MS = 4_000
 // In a subagent's prompt: its own pause thresholds, e.g. [CTM limits: 5h=70 7d=90].
 const LIMITS_MARK = /\[CTM limits:([^\]]*)\]/i
 
@@ -108,13 +107,11 @@ let lastNagAt = Number.NEGATIVE_INFINITY
 let lastWatchCheckAt = 0
 const watches = new Map<LimitKind, LimitWatch>()
 const agentPauseAt = new Map<string, Partial<Record<LimitKind, number>>>() // subagent -> its own pause thresholds
-const holds = new Map<string, { agent: string; since: number }>() // held tool calls, by tool_use_id
 
 // From userConfig, set in register
 let configIntervalMinutes = 3
 let configCompactThreshold = ''
 let configPauseAt: Record<LimitKind, number> = { five_hour: 0, seven_day: 0 }
-let configHoldTools = true
 let cooldownMs = 10 * MINUTE // between two resets or model switches
 let effortCooldownMs = 10 * MINUTE // between two effort changes
 let attachToPrompts = true
@@ -144,9 +141,8 @@ const INFO = [
   `- ${T_SETTINGS}: how often these blocks come (1–${MAX_INTERVAL_MINUTES} min), a compact threshold (tokens like 300k, or a % of the window), and pause thresholds for the 5-hour and 7-day limits. No arguments = show the current settings. Kept across sessions.`,
   '- Past the compact threshold the blocks remind you to compact: do it at the next clean point if your task allows it (a smaller context makes every further request cheaper on the limits) – never break off critical work for it.',
   '- Built-in safety net, always active and not configurable: from 95% of the 5-hour limit and 97% of the 7-day limit the blocks ask you to pause, even with no pause threshold set.',
-  `- Past a pause threshold the blocks ask you to pause: at a clean point call ${T_WAKEUP} and end your turn; you are woken once the limit is back below. You can also use ${T_WAKEUP} on your own, e.g. "wake me when the 5-hour window has reset".`,
-  `- Past a pause threshold (or the safety net) CTM also holds every tool call – yours, your subagents' and workflow agents' – until the limit is back below; then they go on by themselves and are told how long they waited. CTM's own tools stay free. The user can turn this off (/ctm hold off; settings holdTools=false).`,
-  '- Subagents get these blocks too and are held the same way. To give a subagent its own pause thresholds, put e.g. [CTM limits: 5h=70 7d=90] into its prompt (one of the two is enough; "off" leaves only the safety net); CTM takes the mark out and tells the subagent. Lower marks for subagents let the main agent keep going a little longer than its helpers.',
+  `- Past a pause threshold the blocks ask you to pause – a request, not a hard stop: first finish anything that must not be left half-done (e.g. a config file deleted on a live server and not yet recreated, a migration midway), then at that clean point call ${T_WAKEUP} and end your turn; you are woken once the limit is back below. Do not start new work in between. You can also use ${T_WAKEUP} on your own, e.g. "wake me when the 5-hour window has reset".`,
+  `- Subagents get these blocks too. A subagent cannot end its turn and be woken – its turn ending is its end – so for it ${T_WAKEUP} waits right inside the call and returns once the limit is back below. To give a subagent its own pause thresholds, put e.g. [CTM limits: 5h=70 7d=90] into its prompt (one of the two is enough; "off" leaves only the safety net); CTM takes the mark out and tells the subagent. Lower marks for helpers let the main agent keep going a little longer than they do.`,
 ].join('\n')
 
 // ---------------------------------------------------------------- Settings
@@ -214,10 +210,6 @@ function pauseAtFor(kind: LimitKind, agent?: string): number {
   return (agent ? agentPauseAt.get(agent)?.[kind] : undefined) ?? pauseAt(kind)
 }
 
-function holdTools(): boolean {
-  return settings?.holdTools ?? configHoldTools
-}
-
 type PastMark = { kind: LimitKind; percent: number; mark: number; own: boolean; resetsAt: number | null }
 
 // The limits past the pause mark for this agent: its threshold when passed, else the
@@ -259,17 +251,17 @@ function describeAgentLimits(own: Partial<Record<LimitKind, number>>): string {
     .join(', ')
 }
 
-// Waits until done() says so, in steps of HOLD_STEP_MS. A hook's time budget stops
+// Waits until done() says so, in steps of WAIT_STEP_MS. A hook's time budget stops
 // while one of its $ calls is in flight but runs on through $.clock.sleep, so the step
 // is a `sleep` process; $.clock.sleep only where there is none. False when aborted.
 async function waitUntil($: EngineInterface, signal: AbortSignal, done: () => Promise<boolean>): Promise<boolean> {
   while (!(await done())) {
     if (signal.aborted) return false
     const before = await $.clock.now()
-    const r = await safe(() => $.process.run(['sleep', String(HOLD_STEP_MS / 1000)], { timeoutMs: HOLD_STEP_MS + 10_000 }))
-    if (r?.exitCode !== 0 || (await $.clock.now()) - before < HOLD_STEP_MS / 2) {
+    const r = await safe(() => $.process.run(['sleep', String(WAIT_STEP_MS / 1000)], { timeoutMs: WAIT_STEP_MS + 10_000 }))
+    if (r?.exitCode !== 0 || (await $.clock.now()) - before < WAIT_STEP_MS / 2) {
       try {
-        await $.clock.sleep(HOLD_STEP_MS, { signal })
+        await $.clock.sleep(WAIT_STEP_MS, { signal })
       } catch {
         return false
       }
@@ -295,14 +287,12 @@ function describeSettings(): string {
     `- compactThreshold: ${compact}`,
     `- fiveHourPauseAt: ${pause('five_hour')}`,
     `- sevenDayPauseAt: ${pause('seven_day')}`,
-    `- holdTools: ${holdTools() ? 'on (past a pause mark every tool call waits until the limit is back below)' : 'off'}`,
   ]
   if (agentPauseAt.size > 0) {
     lines.push(
       `- subagents' own pause thresholds: ${[...agentPauseAt].map(([a, own]) => `${a}: ${describeAgentLimits(own)}`).join('; ')}`,
     )
   }
-  if (holds.size > 0) lines.push(`- tool calls held right now: ${describeHolds()}`)
   if (watches.size > 0) {
     lines.push(
       `- limit wake-ups armed: ${[...watches.values()].map(w => `${limitName(w.kind)} below ${fmtPercent(w.below)}`).join(', ')}`,
@@ -311,18 +301,11 @@ function describeSettings(): string {
   return lines.join('\n')
 }
 
-function describeHolds(): string {
-  const by = new Map<string, number>()
-  for (const h of holds.values()) by.set(h.agent, (by.get(h.agent) ?? 0) + 1)
-  return `${holds.size} (${[...by].map(([a, n]) => (n > 1 ? `${a} ×${n}` : a)).join(', ')})`
-}
-
 type SettingsChange = {
   intervalMinutes?: unknown
   compactThreshold?: unknown
   fiveHourPauseAt?: unknown
   sevenDayPauseAt?: unknown
-  holdTools?: unknown
 }
 
 // Applies what is given (null = back to the default); returns an error or null.
@@ -360,14 +343,6 @@ async function changeSettings($: EngineInterface, change: SettingsChange): Promi
     }
   }
   if (Object.keys(next.pauseAt!).length === 0) delete next.pauseAt
-
-  if (change.holdTools === null || change.holdTools === 'default') delete next.holdTools
-  else if (change.holdTools !== undefined) {
-    const v = change.holdTools
-    if (v === true || v === 'on') next.holdTools = true
-    else if (v === false || v === 'off') next.holdTools = false
-    else return 'holdTools must be true/false ("on"/"off") or null.'
-  }
 
   await saveSettings($, next)
   return null
@@ -619,9 +594,6 @@ async function report($: EngineInterface, reason: string, recipient = 'main'): P
   } else {
     lines.push('Rate limits: not reported (not signed in with a subscription, or no response yet)')
   }
-  if (recipient === 'main' && holds.size > 0) {
-    notes.push(`CTM is holding tool calls until the limit is back below: ${describeHolds()}.`)
-  }
   for (const w of recipient === 'main' ? watches.values() : []) {
     if (!notes.some(n => n.startsWith(limitName(w.kind)))) {
       const gone = !u.rateLimits.some(r => r.kind === w.kind)
@@ -646,8 +618,9 @@ async function report($: EngineInterface, reason: string, recipient = 'main'): P
   return lines.join('\n')
 }
 
-// What a block says past a pause mark: the main agent pauses and arms a wake-up; a
-// subagent cannot end its turn and be woken, so it waits inside a call.
+// What a block says past a pause mark – a request, never a hard stop: the main agent
+// pauses and arms a wake-up; a subagent cannot end its turn and be woken, so it waits
+// inside the wake-up call.
 function pauseNote(p: PastMark, now: number, agent?: string): string {
   const name = limitName(p.kind)
   const what = p.own
@@ -656,20 +629,19 @@ function pauseNote(p: PastMark, now: number, agent?: string): string {
       'of any pause threshold you set)'
   const resets = p.resetsAt !== null ? ` (the window resets ${fmtAt(p.resetsAt, now)})` : ''
   if (agent) {
-    return holdTools()
-      ? `${name} at ${fmtPercent(p.percent)} ≥ ${what}: CTM holds your tool calls until it is back below${resets} – ` +
-          'nothing to do, carry on when a call returns. At a clean point you can also wait on purpose with ' +
-          `${T_WAKEUP} (limit "${p.kind}").`
-      : `${name} at ${fmtPercent(p.percent)} ≥ ${what}: please pause at the next clean point – call ${T_WAKEUP} ` +
-          `(limit "${p.kind}"); for a subagent it waits inside the call until the limit is back below${resets}, ` +
-          'then you carry on.'
+    return (
+      `${name} at ${fmtPercent(p.percent)} ≥ ${what}: please pause – a request, not a hard stop. First finish ` +
+      'anything that must not be left half-done, then at that clean point call ' +
+      `${T_WAKEUP} (limit "${p.kind}"): for a subagent it waits inside the call until the limit is back below${resets}, ` +
+      'then you carry on.'
+    )
   }
   const w = watches.get(p.kind)
   if (w) return `${name} is past ${what}; wake-up armed for below ${fmtPercent(w.below)} – stay paused until then.`
   return (
-    `${name} at ${fmtPercent(p.percent)} ≥ ${what}: please pause your work at the next clean point – call ` +
-    `${T_WAKEUP} (limit "${p.kind}") and end your turn; you will be woken once it is back below${resets}.` +
-    (holdTools() ? " Until then CTM holds every tool call (yours and your subagents')." : '')
+    `${name} at ${fmtPercent(p.percent)} ≥ ${what}: please pause your work at the next clean point – first finish ` +
+    `anything that must not be left half-done, then call ${T_WAKEUP} (limit "${p.kind}") and end your turn; you ` +
+    `will be woken once it is back below${resets}.`
   )
 }
 
@@ -1052,40 +1024,9 @@ async function watchTick($: EngineInterface): Promise<void> {
   await $.prompt.submit({ text: parts.join('\n') })
 }
 
-// Holds a tool call while a limit is past the agent's pause mark. Resolves null when
-// there was nothing to wait for, the note for the tool result after a wait, or false
-// when the wait was interrupted.
-async function holdCall($: EngineInterface, agent: string | undefined, toolUseId: string | undefined, signal: AbortSignal): Promise<string | null | false> {
-  if (!holdTools()) return null
-  await ensureSettings($)
-  const since = await $.clock.now()
-  const first = pastMarks((await $.session.usage()).rateLimits, since, agent)
-  if (first.length === 0) return null
-  const key = toolUseId || `${agent ?? 'main'}@${since}`
-  holds.set(key, { agent: agent ?? 'main', since })
-  toast($, `CTM: holding a tool call of ${agent ?? 'the main agent'} – ${first.map(p => `${limitName(p.kind)} ${fmtPercent(p.percent)}`).join(', ')}`)
-  let turnedOff = false
-  let done: boolean
-  try {
-    done = await waitUntil($, signal, async () => {
-      if (!holdTools()) return (turnedOff = true)
-      return pastMarks((await $.session.usage()).rateLimits, await $.clock.now(), agent).length === 0
-    })
-  } finally {
-    holds.delete(key)
-  }
-  if (!done) return false
-  const waited = fmtDuration((await $.clock.now()) - since)
-  const why = first.map(p => `the ${limitName(p.kind)} was at ${fmtPercent(p.percent)} (mark ${fmtPercent(p.mark)})`).join(' and ')
-  return (
-    `[CTM] This tool call was held for ${waited} because ${why}; ` +
-    (turnedOff ? 'holding was turned off.' : 'it is back below now. Carry on with your work.')
-  )
-}
-
 // A subagent's settings call: only its own pause thresholds, which apply to it alone.
 async function changeAgentLimits($: EngineInterface, agent: string, change: SettingsChange): Promise<string> {
-  const others = (['intervalMinutes', 'compactThreshold', 'holdTools'] as const).filter(k => k in change)
+  const others = (['intervalMinutes', 'compactThreshold'] as const).filter(k => k in change)
   if (others.length > 0) {
     return (
       `CTM: ${others.join(', ')} ${others.length > 1 ? 'are' : 'is'} the main agent's to set; a subagent can set only ` +
@@ -1127,8 +1068,6 @@ export const register: Register = (on, options) => {
   lastWatchCheckAt = 0
   watches.clear()
   agentPauseAt.clear()
-  holds.clear()
-  configHoldTools = options.holdToolsAtLimit !== false
   cooldownMs = Math.max(0, Number(options.resetCooldownMinutes ?? 10)) * MINUTE
   effortCooldownMs = Math.max(0, Number(options.effortCooldownMinutes ?? 10)) * MINUTE
   attachToPrompts = options.attachToPrompts !== false
@@ -1221,8 +1160,6 @@ export const register: Register = (on, options) => {
         'the reminders to ask).\n' +
         '- fiveHourPauseAt / sevenDayPauseAt (percent, "off"): from this usage on, the blocks ask you to pause ' +
         `and wait for the limit with ${T_WAKEUP}.\n` +
-        '- holdTools (true/false): past a pause mark, every tool call (yours, your subagents\', workflow agents\') ' +
-        'waits until the limit is back below. Change it only when the user asks.\n' +
         'A subagent can set only its own fiveHourPauseAt / sevenDayPauseAt: they apply to it alone.',
       inputSchema: {
         type: 'object',
@@ -1231,7 +1168,6 @@ export const register: Register = (on, options) => {
           compactThreshold: { type: ['string', 'number', 'null'], description: '"300k", 300000, "30%", "off" or null.' },
           fiveHourPauseAt: { type: ['number', 'string', 'null'], description: 'Percent 1–100, "off" or null.' },
           sevenDayPauseAt: { type: ['number', 'string', 'null'], description: 'Percent 1–100, "off" or null.' },
-          holdTools: { type: ['boolean', 'null'], description: 'Hold tool calls past a pause mark; null = default.' },
         },
         additionalProperties: false,
       },
@@ -1242,7 +1178,7 @@ export const register: Register = (on, options) => {
       description:
         'CTM: Arms a wake-up for when a rate limit is back below a mark – after its window resets or once it ' +
         'drops. CTM checks at the update interval while you are idle and then sends you a message, so you can ' +
-        'pause: call this, then end your turn. Use it when a block says a limit is past your pause threshold, ' +
+        'pause: first finish anything that must not be left half-done, then call this and end your turn. Use it when a block says a limit is past your pause threshold, ' +
         'or on your own ("wake me when the 5-hour window has reset"). One wake-up per limit; arming again ' +
         'replaces it, cancel=true removes it. From a subagent it waits right in the call instead and returns ' +
         'once the limit is back below – then carry on.',
@@ -1355,7 +1291,7 @@ export const register: Register = (on, options) => {
         name: 'ctm',
         description:
           'CTM settings: /ctm shows them; /ctm interval 5 · /ctm compact 300k|30%|off|default · ' +
-          '/ctm pause5h 80|off|default · /ctm pause7d 90|off|default · /ctm hold on|off|default',
+          '/ctm pause5h 80|off|default · /ctm pause7d 90|off|default',
       }),
     )
     await ensureSettings($)
@@ -1375,13 +1311,12 @@ export const register: Register = (on, options) => {
       compact: 'compactThreshold',
       pause5h: 'fiveHourPauseAt',
       pause7d: 'sevenDayPauseAt',
-      hold: 'holdTools',
     }[what]
     if (what && (!key || raw === '')) {
       return {
         text:
           'Usage: /ctm · /ctm interval 5 · /ctm compact 300k|30%|off|default · /ctm pause5h 80|off|default · ' +
-          '/ctm pause7d 90|off|default · /ctm hold on|off|default',
+          '/ctm pause7d 90|off|default',
       }
     }
     if (key) {
@@ -1512,7 +1447,7 @@ export const register: Register = (on, options) => {
   on('tool.call', { tool: T_SETTINGS }, async ($, e) => {
     const input = e as unknown as SettingsChange
     const change: SettingsChange = {}
-    for (const k of ['intervalMinutes', 'compactThreshold', 'fiveHourPauseAt', 'sevenDayPauseAt', 'holdTools'] as const) {
+    for (const k of ['intervalMinutes', 'compactThreshold', 'fiveHourPauseAt', 'sevenDayPauseAt'] as const) {
       if (k in input) change[k] = input[k]
     }
     if (e.agentId) return { result: await changeAgentLimits($, e.agentId, change) }
@@ -1695,33 +1630,22 @@ export const register: Register = (on, options) => {
     if (!own) return next(e)
     const prompt =
       `${e.prompt.replace(LIMITS_MARK, '').trim()}\n\n(CTM: your own pause thresholds are ${describeAgentLimits(own)}. ` +
-      'Past one, CTM holds your tool calls until the limit is back below; the CTM blocks say when.)'
+      `Past one, finish what must not be left half-done, then wait with ${T_WAKEUP}; the CTM blocks say when.)`
     const r = await next({ ...e, prompt })
     if (r.agentId) agentPauseAt.set(r.agentId, own)
     return r
   }).catch(($, e, next) => next(e))
 
-  // ---------------------------------------------------------------- Tool calls: holding at a limit, figures while working
+  // ---------------------------------------------------------------- Figures while working
 
-  // Past a pause mark every tool call waits – the main agent's and every subagent's,
-  // each against its own thresholds – until the limit is back below, then runs and
-  // says how long it waited. CTM's own tools stay free. Then, at most every interval,
-  // the current figures go along with a tool result.
   on('tool.call', async ($, e, next) => {
-    if (String(e.tool).startsWith(PREFIX)) return next(e)
-    const held = await holdCall($, e.agentId, (e as { tool_use_id?: string }).tool_use_id, next.signal)
-    if (held === false) return { deny: 'CTM: this tool call was held at a rate limit and the wait was interrupted.' }
     const r = await next(e)
-    if (r.deny !== undefined) return r
-    const context = [...(r.context ?? [])]
-    if (held) context.push(held)
+    if (r.deny !== undefined || String(e.tool).startsWith(PREFIX)) return r
     const recipient = e.agentId ?? 'main'
     const now = await $.clock.now()
-    if (held || now - (lastSent.get(recipient) ?? 0) >= intervalMs()) {
-      lastSent.set(recipient, now)
-      context.push(await report($, 'work update', recipient))
-    }
-    return context.length > (r.context ?? []).length ? { ...r, context } : r
+    if (now - (lastSent.get(recipient) ?? 0) < intervalMs()) return r
+    lastSent.set(recipient, now)
+    return { ...r, context: [...(r.context ?? []), await report($, 'work update', recipient)] }
   }).catch(($, e, next) => next(e))
 
   // ---------------------------------------------------------------- The person's prompts

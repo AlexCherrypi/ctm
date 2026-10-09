@@ -1113,7 +1113,7 @@ describe('cooldowns', () => {
   })
 })
 
-describe('holding tool calls at a limit, and subagents', () => {
+describe('subagents and soft pauses', () => {
   const HIGH: Usage = {
     context: { tokens: 84_000, window: 200_000, percent: 42 },
     rateLimits: [
@@ -1123,58 +1123,27 @@ describe('holding tool calls at a limit, and subagents', () => {
   }
   const NINE = Date.parse('2026-10-08T09:00:00.000Z')
 
-  test('past the pause mark a tool call waits until the window resets, then runs and says so', async ($, on) => {
-    world(on, HIGH)
-    mock.store(on, { settings: { compactThreshold: 'off', pauseAt: { five_hour: 80 } } })
-    const clock = mock.clock(on, { now: NINE })
-    let ran = false
-    on('tool.call', { tool: 'Bash' }, () => {
-      ran = true
-      return { result: 'ran' } as never
-    })
-    await clock.set(Date.parse('2026-10-08T10:58:00.000Z'))
-    const call = $.tool.call({ tool: 'Bash', command: 'ls', agentId: 'sub-1' } as never)
-    await clock.advance(60_000)
-    expect(ran).toBe(false)
-    expect(await status($)).toMatch(/CTM is holding tool calls until the limit is back below: 1 \(sub-1\)/)
-    await clock.advance(70_000) // past 11:00
-    const r = await call
-    expect(ran).toBe(true)
-    expect(r.result).toBe('ran')
-    expect(String(r.context)).toMatch(/held for 2 min because the 5-hour limit was at 85% \(mark 80%\); it is back below now/)
-  })
-
-  test("CTM's own tools are never held, and nothing waits below the mark", async ($, on) => {
-    world(on, HIGH)
-    mock.store(on, { settings: { compactThreshold: 'off', pauseAt: { five_hour: 90 } } })
-    mock.clock(on, { now: NINE })
-    on('tool.call', { tool: 'Bash' }, () => ({ result: 'ran' }) as never)
-    expect((await $.tool.call({ tool: 'Bash', command: 'ls' } as never)).result).toBe('ran')
-    expect(await status($)).toMatch(/5-hour limit: 85% used/)
-  })
-
-  test('holding can be turned off', async ($, on) => {
-    world(on, HIGH)
-    mock.store(on, { settings: { compactThreshold: 'off', pauseAt: { five_hour: 80 }, holdTools: false } })
-    mock.clock(on, { now: NINE })
-    on('tool.call', { tool: 'Bash' }, () => ({ result: 'ran' }) as never)
-    expect((await $.tool.call({ tool: 'Bash', command: 'ls' } as never)).result).toBe('ran')
-    expect(await status($)).not.toMatch(/holds every tool call/)
-  })
-
-  test('the main agent is told its tool calls are held as well', async ($, on) => {
+  test('the pause is a request: finish what must not be left half-done first', async ($, on) => {
     world(on, HIGH)
     mock.store(on, { settings: { compactThreshold: 'off', pauseAt: { five_hour: 80 } } })
     mock.clock(on, { now: NINE })
-    expect(await status($)).toMatch(/please pause.*Until then CTM holds every tool call/)
+    expect(await status($)).toMatch(/please pause your work at the next clean point – first finish anything that must not be left half-done, then call mcp__ctm__limit_wakeup/)
   })
 
-  test('a subagent is told it is held, not to end its turn', async ($, on) => {
+  test('a tool call is never held, even past the mark', async ($, on) => {
+    world(on, HIGH)
+    mock.store(on, { settings: { compactThreshold: 'off', pauseAt: { five_hour: 80 } } })
+    mock.clock(on, { now: NINE })
+    on('tool.call', { tool: 'Bash' }, () => ({ result: 'ran' }) as never)
+    expect((await $.tool.call({ tool: 'Bash', command: 'ls', agentId: 'sub-1' } as never)).result).toBe('ran')
+  })
+
+  test('a subagent is told to wait inside limit_wakeup, not to end its turn', async ($, on) => {
     world(on, HIGH)
     mock.store(on, { settings: { compactThreshold: 'off', pauseAt: { five_hour: 80 } } })
     mock.clock(on, { now: NINE })
     const s = await status($, 'sub-1')
-    expect(s).toMatch(/CTM holds your tool calls until it is back below \(the window resets at 11:00\)/)
+    expect(s).toMatch(/please pause – a request, not a hard stop.*for a subagent it waits inside the call until the limit is back below \(the window resets at 11:00\)/)
     expect(s).not.toMatch(/end your turn/)
   })
 
@@ -1190,7 +1159,7 @@ describe('holding tool calls at a limit, and subagents', () => {
     await $.agent.spawn({ prompt: 'Review the diff. [CTM limits: 5h=80 7d=off]', description: 'review' } as never)
     expect(prompt).not.toContain('[CTM limits')
     expect(prompt).toMatch(/^Review the diff\.\n\n\(CTM: your own pause thresholds are 5-hour limit 80%, 7-day limit off/)
-    expect(await status($, 'sub-7')).toMatch(/5-hour limit at 85% ≥ your own pause threshold 80%: CTM holds your tool calls/)
+    expect(await status($, 'sub-7')).toMatch(/5-hour limit at 85% ≥ your own pause threshold 80%: please pause/)
     expect(await status($)).not.toMatch(/pause/)
     expect(await status($, 'sub-8')).not.toMatch(/pause/)
   })

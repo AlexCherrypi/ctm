@@ -51,7 +51,7 @@ The model gets this legend once, in the CTM part of its system prompt (cached).
 
 - `mcp__ctm__status` – the current figures on demand.
 - `mcp__ctm__idle_updates` `{ enabled, maxMinutes? }` – idle updates on/off for this session.
-- `mcp__ctm__settings` `{ intervalMinutes?, compactThreshold?, fiveHourPauseAt?, sevenDayPauseAt?, holdTools? }` –
+- `mcp__ctm__settings` `{ intervalMinutes?, compactThreshold?, fiveHourPauseAt?, sevenDayPauseAt? }` –
   shows (no arguments) or changes the settings; `null` puts one back to its default. From a
   subagent it sets only that subagent's own `fiveHourPauseAt` / `sevenDayPauseAt`.
 - `mcp__ctm__limit_wakeup` `{ limit, belowPercent?, note?, cancel? }` – arms a wake-up for when the
@@ -134,8 +134,10 @@ settings, or arms or fires a limit wake-up.
   While it is **not set**, CTM nudges the model at most every 30 minutes to ask you whether to set
   one. Set it to `off` if you don't want one – that stops the nudging.
 - **Pause thresholds** (`fiveHourPauseAt`, `sevenDayPauseAt`, in percent; off by default, no
-  nudging): once a limit passes its threshold, every block asks the model to pause at the next
-  clean point, arm `mcp__ctm__limit_wakeup` and end its turn.
+  nudging): once a limit passes its threshold, every block asks the model to pause – **a request,
+  never a hard stop**: it first finishes anything that must not be left half-done (a config file
+  deleted on a live server and not yet recreated, a migration midway), then at that clean point
+  arms `mcp__ctm__limit_wakeup` and ends its turn. CTM never holds or blocks a tool call.
 - **Built-in safety threshold** (always active, **not configurable**): from **95%** of the 5-hour
   limit and **97%** of the 7-day limit the blocks ask the model to pause, even if no pause
   threshold is set – and even if yours is higher. The line says it is this built-in fallback. If
@@ -147,19 +149,8 @@ settings, or arms or fires a limit wake-up.
   CTM treats a window whose reset time has passed as reset – also when the limit drops out of the
   readings after its reset. Right when a known reset time passes, CTM checks at once instead of
   waiting for the next interval.
-- **Holding tool calls** (`holdTools`, on by default): past a pause threshold or the safety
-  threshold, **every tool call waits** – the main agent's, each subagent's and each workflow
-  agent's – until the limit is back below, then runs and the agent is told how long it waited
-  (`[CTM] This tool call was held for 2 h 13 min because …`). So a big session with many subagents
-  stops as a whole near a limit and goes on as a whole afterwards, without any agent losing its
-  context. CTM's own tools stay free. An agent that is generating an answer finishes it first; the
-  hold starts at its next tool call. `/ctm hold off` turns it off (it also releases the calls held
-  right now); with the 7-day safety net at 97% a hold can last until that window resets.
-  A held call waits in steps of a `sleep` process (a hook's time budget runs on through the
-  plugin clock's own waits); on a host without `sleep` the hold gives up after a few seconds and
-  the call runs.
-- **Subagents**: get the blocks like the main agent, with their own wording (they cannot end their
-  turn and be woken: they are held, or wait inside `limit_wakeup`). To give a subagent **its own
+- **Subagents**: get the blocks like the main agent, with their own wording: they cannot end their
+  turn and be woken (their turn ending is their end), so they wait inside `limit_wakeup`. To give a subagent **its own
   pause thresholds**, put e.g. `[CTM limits: 5h=70 7d=90]` into its prompt (one of the two is
   enough; `off` leaves only the safety net) – CTM takes the mark out and tells the subagent. Lower
   marks for helpers let the main agent go on a little longer than they do. A subagent can also set
@@ -182,7 +173,6 @@ take precedence over the options below.
 /ctm compact 300k             compact threshold (also 30%, off, default)
 /ctm pause5h 80               pause at 80% of the 5-hour limit (also off, default)
 /ctm pause7d 90               pause at 90% of the 7-day limit
-/ctm hold off                 do not hold tool calls past a pause mark (also on, default)
 ```
 
 The model is told when you change them.
@@ -195,7 +185,6 @@ The model is told when you change them.
 | `compactThreshold` | empty | `300k`, `30%`, `off`; empty = unset (the model is nudged to ask you) |
 | `fiveHourPauseAt` | 0 | Pause threshold for the 5-hour limit in percent, 0 = off |
 | `sevenDayPauseAt` | 0 | Pause threshold for the 7-day limit in percent, 0 = off |
-| `holdToolsAtLimit` | true | Past a pause threshold or the safety net, every tool call (main agent, subagents, workflow agents) waits until the limit is back below |
 | `resetCooldownMinutes` | 10 | Minimum time between two compact/clear/model switches (one shared gap), 0 = none |
 | `effortCooldownMinutes` | 10 | Minimum time between two effort changes, independent of the one above, 0 = none |
 | `attachToPrompts` | true | Attach the figures to your own prompts |

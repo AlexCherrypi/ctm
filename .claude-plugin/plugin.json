@@ -1,6 +1,6 @@
 {
   "name": "ctm",
-  "version": "0.9.0",
+  "version": "0.9.1",
   "description": "Context and Token Manager: keeps the model informed about its context window and the 5-hour / 7-day rate limits, each with its change since the last report, and lets it compact or clear itself, switch its own model or change its own effort – always with a resume prompt.",
   "author": {
     "name": "AlexCherrypi"
@@ -29,12 +29,6 @@
       "title": "Pause at 7-day limit (%)",
       "description": "From this usage of the 7-day limit on, CTM asks the model to pause and wake itself once it is back below. 0 = off.",
       "default": 0
-    },
-    "holdToolsAtLimit": {
-      "type": "boolean",
-      "title": "Hold tool calls at a limit",
-      "description": "Past a pause threshold (or the built-in safety net: 5-hour 95%, 7-day 97%), every tool call – the main agent's, its subagents' and workflow agents' – waits until the limit is back below, then goes on by itself. /ctm hold or the model's settings tool (on the person's request) can override it.",
-      "default": true
     },
     "resetCooldownMinutes": {
       "type": "number",

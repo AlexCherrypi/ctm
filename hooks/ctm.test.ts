@@ -1112,3 +1112,115 @@ describe('cooldowns', () => {
     expect((await $.tool.call({ tool: 'mcp__ctm__set_effort', level: 'max' } as never)).deny).toBeUndefined()
   })
 })
+
+describe('holding tool calls at a limit, and subagents', () => {
+  const HIGH: Usage = {
+    context: { tokens: 84_000, window: 200_000, percent: 42 },
+    rateLimits: [
+      { kind: 'five_hour', percentUsed: 85, resetsAt: '2026-10-08T11:00:00.000Z' },
+      { kind: 'seven_day', percentUsed: 41.2, resetsAt: '2026-10-12T09:00:00.000Z' },
+    ],
+  }
+  const NINE = Date.parse('2026-10-08T09:00:00.000Z')
+
+  test('past the pause mark a tool call waits until the window resets, then runs and says so', async ($, on) => {
+    world(on, HIGH)
+    mock.store(on, { settings: { compactThreshold: 'off', pauseAt: { five_hour: 80 } } })
+    const clock = mock.clock(on, { now: NINE })
+    let ran = false
+    on('tool.call', { tool: 'Bash' }, () => {
+      ran = true
+      return { result: 'ran' } as never
+    })
+    await clock.set(Date.parse('2026-10-08T10:58:00.000Z'))
+    const call = $.tool.call({ tool: 'Bash', command: 'ls', agentId: 'sub-1' } as never)
+    await clock.advance(60_000)
+    expect(ran).toBe(false)
+    expect(await status($)).toMatch(/CTM is holding tool calls until the limit is back below: 1 \(sub-1\)/)
+    await clock.advance(70_000) // past 11:00
+    const r = await call
+    expect(ran).toBe(true)
+    expect(r.result).toBe('ran')
+    expect(String(r.context)).toMatch(/held for 2 min because the 5-hour limit was at 85% \(mark 80%\); it is back below now/)
+  })
+
+  test("CTM's own tools are never held, and nothing waits below the mark", async ($, on) => {
+    world(on, HIGH)
+    mock.store(on, { settings: { compactThreshold: 'off', pauseAt: { five_hour: 90 } } })
+    mock.clock(on, { now: NINE })
+    on('tool.call', { tool: 'Bash' }, () => ({ result: 'ran' }) as never)
+    expect((await $.tool.call({ tool: 'Bash', command: 'ls' } as never)).result).toBe('ran')
+    expect(await status($)).toMatch(/5-hour limit: 85% used/)
+  })
+
+  test('holding can be turned off', async ($, on) => {
+    world(on, HIGH)
+    mock.store(on, { settings: { compactThreshold: 'off', pauseAt: { five_hour: 80 }, holdTools: false } })
+    mock.clock(on, { now: NINE })
+    on('tool.call', { tool: 'Bash' }, () => ({ result: 'ran' }) as never)
+    expect((await $.tool.call({ tool: 'Bash', command: 'ls' } as never)).result).toBe('ran')
+    expect(await status($)).not.toMatch(/holds every tool call/)
+  })
+
+  test('the main agent is told its tool calls are held as well', async ($, on) => {
+    world(on, HIGH)
+    mock.store(on, { settings: { compactThreshold: 'off', pauseAt: { five_hour: 80 } } })
+    mock.clock(on, { now: NINE })
+    expect(await status($)).toMatch(/please pause.*Until then CTM holds every tool call/)
+  })
+
+  test('a subagent is told it is held, not to end its turn', async ($, on) => {
+    world(on, HIGH)
+    mock.store(on, { settings: { compactThreshold: 'off', pauseAt: { five_hour: 80 } } })
+    mock.clock(on, { now: NINE })
+    const s = await status($, 'sub-1')
+    expect(s).toMatch(/CTM holds your tool calls until it is back below \(the window resets at 11:00\)/)
+    expect(s).not.toMatch(/end your turn/)
+  })
+
+  test('[CTM limits: …] in a subagent prompt gives it its own pause thresholds', async ($, on) => {
+    world(on, HIGH) // 5-hour at 85%: below the safety net, no common threshold
+    mock.store(on, { settings: { compactThreshold: 'off' } })
+    mock.clock(on, { now: NINE })
+    let prompt = ''
+    on('agent.spawn', (_$, e) => {
+      prompt = e.prompt
+      return { model: 'claude-haiku-5-5', agentId: 'sub-7' } as never
+    })
+    await $.agent.spawn({ prompt: 'Review the diff. [CTM limits: 5h=80 7d=off]', description: 'review' } as never)
+    expect(prompt).not.toContain('[CTM limits')
+    expect(prompt).toMatch(/^Review the diff\.\n\n\(CTM: your own pause thresholds are 5-hour limit 80%, 7-day limit off/)
+    expect(await status($, 'sub-7')).toMatch(/5-hour limit at 85% ≥ your own pause threshold 80%: CTM holds your tool calls/)
+    expect(await status($)).not.toMatch(/pause/)
+    expect(await status($, 'sub-8')).not.toMatch(/pause/)
+  })
+
+  test('a subagent sets only its own pause thresholds', async ($, on) => {
+    world(on, HIGH)
+    mock.store(on, { settings: { compactThreshold: 'off' } })
+    mock.clock(on, { now: NINE })
+    const r = String((await $.tool.call({ tool: 'mcp__ctm__settings', fiveHourPauseAt: 80, agentId: 'sub-1' } as never)).result)
+    expect(r).toMatch(/^Your own pause thresholds: 5-hour limit 80%\./)
+    expect(r).toMatch(/your own pause threshold 80%/)
+    expect(await status($)).not.toMatch(/pause/)
+    const r2 = String((await $.tool.call({ tool: 'mcp__ctm__settings', intervalMinutes: 5, agentId: 'sub-1' } as never)).result)
+    expect(r2).toMatch(/intervalMinutes is the main agent's to set/)
+  })
+
+  test('limit_wakeup from a subagent waits inside the call', async ($, on) => {
+    world(on, HIGH)
+    mock.store(on, { settings: { compactThreshold: 'off', pauseAt: { five_hour: 80 } } })
+    const clock = mock.clock(on, { now: NINE })
+    await clock.set(Date.parse('2026-10-08T10:58:00.000Z'))
+    let done = false
+    const call = $.tool.call({ tool: 'mcp__ctm__limit_wakeup', limit: 'five_hour', note: 'Go on.', agentId: 'sub-1' } as never).then(
+      r => ((done = true), r),
+    )
+    await clock.advance(60_000)
+    expect(done).toBe(false)
+    await clock.advance(70_000)
+    const r = await call
+    expect(String(r.result)).toMatch(/the 5-hour limit is below 80% again \(its window reset at 11:00\)\. Carry on/)
+    expect(String(r.result)).toContain('Go on.')
+  })
+})

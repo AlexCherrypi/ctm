@@ -51,10 +51,13 @@ The model gets this legend once, in the CTM part of its system prompt (cached).
 
 - `mcp__ctm__status` – the current figures on demand.
 - `mcp__ctm__idle_updates` `{ enabled, maxMinutes? }` – idle updates on/off for this session.
-- `mcp__ctm__settings` `{ intervalMinutes?, compactThreshold?, fiveHourPauseAt?, sevenDayPauseAt? }` –
-  shows (no arguments) or changes the settings; `null` puts one back to its default.
+- `mcp__ctm__settings` `{ intervalMinutes?, compactThreshold?, fiveHourPauseAt?, sevenDayPauseAt?, holdTools? }` –
+  shows (no arguments) or changes the settings; `null` puts one back to its default. From a
+  subagent it sets only that subagent's own `fiveHourPauseAt` / `sevenDayPauseAt`.
 - `mcp__ctm__limit_wakeup` `{ limit, belowPercent?, note?, cancel? }` – arms a wake-up for when the
-  5-hour or 7-day limit is back below a mark (default: its pause threshold).
+  5-hour or 7-day limit is back below a mark (default: its pause threshold). From a subagent –
+  whose turn ending would be its end – it waits right inside the call and returns once the limit
+  is back below.
 - `mcp__ctm__reset` `{ mode, instructions?, resumePrompt }` – schedules a compact or clear for
   the end of the current turn. Rules:
   - `resumePrompt` is required; `compact` also requires `instructions` for the summary. Both
@@ -141,7 +144,27 @@ settings, or arms or fires a limit wake-up.
   is back below the mark – because its window reset, or because it dropped – and then wakes the
   model with a message (plus its own note). The model can also arm one on its own, e.g. "wake me
   when the 5-hour window has reset". Rate limits arrive with responses, so while the model pauses
-  CTM treats a window whose reset time has passed as reset.
+  CTM treats a window whose reset time has passed as reset – also when the limit drops out of the
+  readings after its reset. Right when a known reset time passes, CTM checks at once instead of
+  waiting for the next interval.
+- **Holding tool calls** (`holdTools`, on by default): past a pause threshold or the safety
+  threshold, **every tool call waits** – the main agent's, each subagent's and each workflow
+  agent's – until the limit is back below, then runs and the agent is told how long it waited
+  (`[CTM] This tool call was held for 2 h 13 min because …`). So a big session with many subagents
+  stops as a whole near a limit and goes on as a whole afterwards, without any agent losing its
+  context. CTM's own tools stay free. An agent that is generating an answer finishes it first; the
+  hold starts at its next tool call. `/ctm hold off` turns it off (it also releases the calls held
+  right now); with the 7-day safety net at 97% a hold can last until that window resets.
+  A held call waits in steps of a `sleep` process (a hook's time budget runs on through the
+  plugin clock's own waits); on a host without `sleep` the hold gives up after a few seconds and
+  the call runs.
+- **Subagents**: get the blocks like the main agent, with their own wording (they cannot end their
+  turn and be woken: they are held, or wait inside `limit_wakeup`). To give a subagent **its own
+  pause thresholds**, put e.g. `[CTM limits: 5h=70 7d=90]` into its prompt (one of the two is
+  enough; `off` leaves only the safety net) – CTM takes the mark out and tells the subagent. Lower
+  marks for helpers let the main agent go on a little longer than they do. A subagent can also set
+  its own with the settings tool. Not possible with the plugin API today: compacting a subagent
+  (Claude Code compacts it itself when it fills up) and a context figure per subagent.
 
 Whenever a setting changes, the answer carries the current figures right away: a threshold
 that is **already passed** when it is set (e.g. a compact threshold of 50k with 84k in the
@@ -159,6 +182,7 @@ take precedence over the options below.
 /ctm compact 300k             compact threshold (also 30%, off, default)
 /ctm pause5h 80               pause at 80% of the 5-hour limit (also off, default)
 /ctm pause7d 90               pause at 90% of the 7-day limit
+/ctm hold off                 do not hold tool calls past a pause mark (also on, default)
 ```
 
 The model is told when you change them.
@@ -171,6 +195,7 @@ The model is told when you change them.
 | `compactThreshold` | empty | `300k`, `30%`, `off`; empty = unset (the model is nudged to ask you) |
 | `fiveHourPauseAt` | 0 | Pause threshold for the 5-hour limit in percent, 0 = off |
 | `sevenDayPauseAt` | 0 | Pause threshold for the 7-day limit in percent, 0 = off |
+| `holdToolsAtLimit` | true | Past a pause threshold or the safety net, every tool call (main agent, subagents, workflow agents) waits until the limit is back below |
 | `resetCooldownMinutes` | 10 | Minimum time between two compact/clear/model switches (one shared gap), 0 = none |
 | `effortCooldownMinutes` | 10 | Minimum time between two effort changes, independent of the one above, 0 = none |
 | `attachToPrompts` | true | Attach the figures to your own prompts |
@@ -195,8 +220,8 @@ when signed in with a claude.ai subscription, and only after the first response 
 
 ## Notes
 
-- Settings are kept across sessions. Everything else (idle updates, armed wake-ups, cooldown, the
-  previous report for Δ) is per session and survives `/clear`, not a reload of the mod.
+- Settings are kept across sessions. Everything else (idle updates, armed wake-ups, subagents' own
+  thresholds, cooldown, the previous report for Δ) is per session and survives `/clear`, not a reload of the mod.
 - Idle updates cost quota: each one is a turn of its own.
 - Like a reset, a scheduled model switch runs after the turn has ended, so a one-shot `claude -p`
   exits before it happens; long-lived sessions (interactive, SDK, cloud) run it.

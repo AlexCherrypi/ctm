@@ -3,7 +3,7 @@
 # webhook that makes claude.ai re-sync.
 # Each marketplace needs its own secret: a fine-grained token with
 # "Contents: read and write" on that marketplace repo. Without the secret the
-# step is skipped; the marketplace still picks the change up within 30 min.
+# step is skipped; the marketplace still picks the change up with its daily check.
 name: Notify marketplaces
 
 on:

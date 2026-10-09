@@ -913,12 +913,13 @@ function watchMet(w: LimitWatch, r: { percentUsed: number; resetsAt?: string } |
   return null
 }
 
-// Checks the armed wake-ups once per interval, and only while the model is idle: a
-// wake-up starts a turn.
+// Checks the armed wake-ups once per interval, and right when a known window reset has
+// passed – only while the model is idle: a wake-up starts a turn.
 async function watchTick($: EngineInterface): Promise<void> {
   if (watches.size === 0 || busy || pending || awaiting) return
   const now = await $.clock.now()
-  if (now - lastWatchCheckAt < intervalMs()) return
+  const resetPassed = [...watches.values()].some(w => w.resetsAt !== null && w.resetsAt > lastWatchCheckAt && w.resetsAt <= now)
+  if (!resetPassed && now - lastWatchCheckAt < intervalMs()) return
   lastWatchCheckAt = now
   const u = await $.session.usage({ breakdown: 'summary' })
   const met: string[] = []

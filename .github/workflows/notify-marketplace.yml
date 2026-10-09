@@ -1,0 +1,30 @@
+# Tells the wemotion marketplace (wemotion-gmbh/claude-plugins) that this
+# plugin changed. Its workflow then pins the new commit in marketplace.json,
+# and that push fires the webhook that makes claude.ai re-sync.
+# Needs the secret MARKETPLACE_DISPATCH_TOKEN: a fine-grained token with
+# "Contents: read and write" on wemotion-gmbh/claude-plugins. Without it this
+# job does nothing; the marketplace still picks the change up within 30 min.
+name: Notify marketplace
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send repository_dispatch
+        env:
+          TOKEN: ${{ secrets.MARKETPLACE_DISPATCH_TOKEN }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "::notice::MARKETPLACE_DISPATCH_TOKEN not set – skipping"
+            exit 0
+          fi
+          curl -fsS -X POST \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/wemotion-gmbh/claude-plugins/dispatches \
+            -d "{\"event_type\":\"plugin-updated\",\"client_payload\":{\"repo\":\"$GITHUB_REPOSITORY\",\"sha\":\"$GITHUB_SHA\"}}"

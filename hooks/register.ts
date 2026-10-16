@@ -21,10 +21,9 @@ import type { EngineInterface, Register } from 'claude-code'
 //    the person for one), and pause thresholds for the 5-hour and 7-day limits (the
 //    blocks ask the model to pause past them; `limit_wakeup` wakes it once the limit
 //    is back below).
-// 6. Reads the 5h/7d limits fresh from the server where the host's own reading is
-//    frozen – while idle (wake-ups, idle updates), on demand (`status` refresh) and
-//    after a switch to another account – through a second `claude`'s get_usage
-//    request: no model request, no tokens.
+// 6. Reads the 5h/7d limits from the server – a second `claude`'s get_usage request,
+//    no model request, no tokens – at most every few minutes; the host's own reading
+//    (from the last model response) is the fallback.
 //
 // Settings are kept across sessions in $.store. Everything else lives in module
 // variables: it survives /clear (the module is not reloaded then) and is scoped to
@@ -57,9 +56,9 @@ type Settings = {
 // resetsAt: the window's last known reset (ms) – the host can drop a limit from its
 // readings once that window has ended, and no new reading comes while the model pauses.
 type LimitWatch = { kind: LimitKind; below: number; note: string; resetsAt: number | null }
-// A rate limit as a block shows it: the host's own, or one CTM fetched from the server
-// (fetchedAt).
-type RateLimit = { kind: string; percentUsed: number; resetsAt?: string; fetchedAt?: number }
+// A rate limit as a block shows it: from the server, or the host's own. asOf: a server
+// reading old enough to say when it was taken.
+type RateLimit = { kind: string; percentUsed: number; resetsAt?: string; asOf?: number }
 type ServerLimit = { kind: LimitKind; percentUsed: number; resetsAt?: string }
 type ServerReading = { at: number; account: string | null; limits: ServerLimit[] }
 
@@ -93,10 +92,11 @@ const CLEAR_CONFIRM_MS = 2 * 60_000
 const CHECK_TIMEOUT_MS = 30_000
 const CATALOG_TIMEOUT_MS = 20_000
 const CATALOG_TTL_MS = 15 * 60_000
-const USAGE_TIMEOUT_MS = 20_000
-const USAGE_GAP_MS = 3 * 60_000 // between two server readings while idle
+const USAGE_TIMEOUT_MS = 10_000
+const USAGE_GAP_MS = 3 * 60_000 // a server reading this old is taken again
 const USAGE_DEMAND_GAP_MS = 30_000 // between two the model asks for (status refresh)
 const USAGE_MAX_AGE_MS = 10 * 60_000 // an answer older than this is the engine's cache
+const USAGE_SHOW_MS = 10 * 60_000 // a server reading beats a newer model response up to this age
 const USAGE_BACKOFF_MS = 5 * 60_000 // after a failed reading, doubling each time
 const USAGE_BACKOFF_MAX_MS = 60 * 60_000
 
@@ -153,9 +153,9 @@ const INFO = [
   '```',
   '- The header gives the current local date and time and the time zone; every later time is in that zone (HH:MM on the same day, otherwise with weekday and date).',
   '- Δ is the change since the previous CTM block you received – the header names when that was – never a running total. "Δ window reset" means the limit window reset in between.',
-  '- The 5-hour and 7-day limits are account-wide: their Δ includes every parallel session of the account, not just yours. They come with your model responses; while you are idle (idle updates, wake-ups) CTM reads them from the server instead, at no token cost – such a line ends in "fetched from the server at HH:MM".',
+  '- The 5-hour and 7-day limits are account-wide: their Δ includes every parallel session of the account, not just yours. CTM reads them from the server (Claude Code\'s usage meter, no tokens) at most every 3 min – "as of HH:MM" marks an older reading; where the server cannot be read, they come from your last model response.',
   '- When a limit climbs fast or is high, work more economically: fewer parallel subagents, read only what you need, compact earlier.',
-  `- ${T_STATUS}: the current block on demand; refresh=true fetches the limits fresh from the server first (a few seconds, no tokens).`,
+  `- ${T_STATUS}: the current block on demand; refresh=true reads the limits anew from the server first (a few seconds, no tokens).`,
   `- ${T_IDLE}: blocks while you are idle as well (each one starts a new turn and costs quota; use sparingly, with maxMinutes).`,
   `- ${T_RESET}: schedules a compact (summary; needs instructions) or a clear (everything gone) for the end of your turn, then sends you your resumePrompt so you carry on. The resumePrompt is what you can rely on afterwards: next step, key facts, and every important rule – no length limit, be complete; or write them to a file and give its exact path in the resumePrompt.`,
   'A good moment for compact/clear is right after finishing a sub-task, before the context gets tight – never in the middle of a change.',
@@ -549,10 +549,11 @@ function fmtAt(ms: number, ref: number): string {
 // The host fills $.session.usage().rateLimits only from the headers of model responses:
 // while the session is idle that reading stays frozen, usage elsewhere on the account
 // stays unseen, and right after /login to another account it is the old account's. So
-// where that matters CTM asks a second, short-lived `claude` for the account's usage
+// the limits come from a second, short-lived `claude` asked for the account's usage
 // meter – the SDK's get_usage request, the fetch /usage does. It sends nothing to a
 // model and costs no tokens (about 3 s). The endpoint answers 429 when asked too often:
-// at most every USAGE_GAP_MS while idle, and a failure backs off.
+// a reading is taken again once it is USAGE_GAP_MS old, and a failure backs off. The
+// host's own reading is the fallback.
 
 // The signed-in account, as ~/.claude.json names it; null where it cannot be read.
 async function readAccount($: EngineInterface): Promise<string | null> {
@@ -672,7 +673,8 @@ async function refreshLimits($: EngineInterface, demand = false): Promise<void> 
     const r = await fetchUsage($)
     const at = await $.clock.now()
     if ('limits' in r) {
-      serverReading = { at, account: forAccount, limits: r.limits }
+      // Dated when it was asked for, so the next one is due USAGE_GAP_MS after this one.
+      serverReading = { at: now, account: forAccount, limits: r.limits }
       usageFailures = 0
       usageBackoffUntil = 0
       usageError = null
@@ -704,19 +706,29 @@ async function refreshOnDemand($: EngineInterface): Promise<string> {
   return `No fresh reading from the server: the last one was asked for ${fmtDuration(now - tried)} ago (at most every ${USAGE_DEMAND_GAP_MS / 1000} s).`
 }
 
-// The rate limits to go by: the host's own, each replaced by the server reading where
-// that is newer than the last model response. After a switch to another account the
+// The rate limits to go by: the server reading for this account – up to USAGE_SHOW_MS
+// old, and after that while no model response came since – else the host's own, which
+// also fill in what the server does not name. After a switch to another account the
 // host's own belong to the old one until the next response, so they are left out.
-function limitsNow(own: readonly RateLimit[]): RateLimit[] {
+function limitsNow(own: readonly RateLimit[], now: number): RateLimit[] {
   const out: RateLimit[] = accountSwitchedAt > lastResponseAt ? [] : [...own]
   const s = serverReading
-  if (!s || s.at <= lastResponseAt || s.account !== (account ?? null)) return out
+  if (!s || s.account !== (account ?? null) || (now - s.at > USAGE_SHOW_MS && s.at <= lastResponseAt)) return out
+  const old = now - s.at >= USAGE_GAP_MS // a newer one failed or is held back
   for (const l of s.limits) {
-    const i = out.findIndex(r => r.kind === l.kind)
-    if (i >= 0) out[i] = { ...l, fetchedAt: s.at }
-    else out.push({ ...l, fetchedAt: s.at })
+    const r: RateLimit = old ? { ...l, asOf: s.at } : { ...l }
+    const i = out.findIndex(x => x.kind === l.kind)
+    if (i >= 0) out[i] = r
+    else out.push(r)
   }
   return out
+}
+
+// The rate limits now, with a new server reading first once the last one is due.
+async function currentLimits($: EngineInterface, own: readonly RateLimit[]): Promise<RateLimit[]> {
+  const s = serverReading
+  if (!s || s.account !== (account ?? null) || (await $.clock.now()) - s.at >= USAGE_GAP_MS) await refreshLimits($)
+  return limitsNow(own, await $.clock.now())
 }
 
 // ---------------------------------------------------------------- The report
@@ -772,7 +784,7 @@ async function report($: EngineInterface, reason: string, recipient = 'main'): P
 
   // Rate limits
   const limits: Record<string, LimitReading> = {}
-  const rateLimits = limitsNow(u.rateLimits)
+  const rateLimits = await currentLimits($, u.rateLimits)
   if (rateLimits.length > 0) {
     for (const r of rateLimits) {
       const reading = { percent: r.percentUsed, resetsAt: r.resetsAt ?? null }
@@ -787,7 +799,7 @@ async function report($: EngineInterface, reason: string, recipient = 'main'): P
           ? ` · window reset ${fmtAt(at, now)} – this reading is from before, it is lower now`
           : ` · resets ${fmtAt(at, now)} (in ${fmtSpan(now, at)})`
       }
-      if (r.fetchedAt !== undefined) line += ` · fetched from the server ${fmtAt(r.fetchedAt, now)}`
+      if (r.asOf !== undefined) line += ` · as of ${fmtClock(r.asOf, now)}`
       lines.push(line)
     }
     const agent = recipient === 'main' ? undefined : recipient
@@ -1209,10 +1221,9 @@ async function watchTick($: EngineInterface): Promise<void> {
   const resetPassed = [...watches.values()].some(w => w.resetsAt !== null && w.resetsAt > lastWatchCheckAt && w.resetsAt <= now)
   if (!resetPassed && now - lastWatchCheckAt < intervalMs()) return
   lastWatchCheckAt = now
-  await refreshLimits($)
-  if (busy || pending || awaiting) return // a turn started while CTM read the server
   const u = await $.session.usage({ breakdown: 'summary' })
-  const limits = limitsNow(u.rateLimits)
+  const limits = await currentLimits($, u.rateLimits)
+  if (busy || pending || awaiting) return // a turn started while CTM read the server
   const met: string[] = []
   const notes: string[] = []
   for (const w of [...watches.values()]) {
@@ -1299,15 +1310,15 @@ export const register: Register = (on, options) => {
       description:
         'CTM: Returns the current CTM block – context window fill and auto-compact threshold, the 5-hour and ' +
         '7-day rate limits with reset times, and how each changed since your previous CTM block. The limits ' +
-        'come with your model responses; refresh=true reads them fresh from the server first.',
+        'are read from the server at most every 3 min; refresh=true reads them anew first.',
       inputSchema: {
         type: 'object',
         properties: {
           refresh: {
             type: 'boolean',
             description:
-              'true: fetch the 5-hour and 7-day limits fresh from the server first (a few seconds, no tokens) – ' +
-              'e.g. after a long pause, or when a reading is from before its window reset. At most every 30 s.',
+              'true: read the 5-hour and 7-day limits anew from the server first (a few seconds, no tokens) – ' +
+              'e.g. when a reading is marked "as of" or is from before its window reset. At most every 30 s.',
           },
         },
         additionalProperties: false,
@@ -1713,7 +1724,7 @@ export const register: Register = (on, options) => {
     if (!(below > 0 && below <= 100)) return { deny: 'CTM: belowPercent must be from 1 to 100.' }
     const now = await $.clock.now()
     const u = await $.session.usage({ breakdown: 'summary' })
-    const r = limitsNow(u.rateLimits).find(x => x.kind === kind)
+    const r = (await currentLimits($, u.rateLimits)).find(x => x.kind === kind)
     const watch: LimitWatch = {
       kind,
       below,
@@ -1727,9 +1738,8 @@ export const register: Register = (on, options) => {
       // A subagent's turn ending is its end: it waits here instead.
       let why: string | null = null
       const done = await waitUntil($, next.signal, async () => {
-        await refreshLimits($)
         const u2 = await $.session.usage()
-        why = watchMet(watch, limitsNow(u2.rateLimits).find(x => x.kind === kind), await $.clock.now())
+        why = watchMet(watch, (await currentLimits($, u2.rateLimits)).find(x => x.kind === kind), await $.clock.now())
         return why !== null
       })
       if (!done) return { result: 'CTM: the wait was interrupted.' }
@@ -1852,7 +1862,7 @@ export const register: Register = (on, options) => {
   on('turn.step', async function* ($, e, next) {
     if (!e.agentId && e.effort !== undefined) lastEffort = String(e.effort)
     const r = yield* next(e)
-    lastResponseAt = await $.clock.now() // the host's own limit reading is the newest now
+    lastResponseAt = await $.clock.now() // the host's own limit reading is from now
     return r
   })
 

@@ -1246,12 +1246,13 @@ describe('server readings', () => {
     await $.tool.call({ tool: 'mcp__ctm__limit_wakeup', limit: 'five_hour', note: 'Go on.' } as never)
     await clock.advance(119 * 60_000) // 10:59
     expect(seen.prompts).toHaveLength(0)
-    expect(seen.usageFetches.length).toBe(1) // the interval check at 10:00
+    expect(seen.usageFetches.length).toBe(2) // arming at 09:00, the interval check at 10:00
     seen.server.current = meter(3, { five_hour: { utilization: 3, resets_at: '2026-10-08T16:00:00.000Z' } })
     await clock.advance(60_000) // 11:00: the new window, as the server counts it
     expect(seen.prompts).toHaveLength(1)
     expect(seen.prompts[0]).toMatch(/the 5-hour limit is below 80% again \(it is at 3%\)/)
-    expect(seen.prompts[0]).toMatch(/5-hour limit: 3% used.* · fetched from the server at \d\d:\d\d/)
+    expect(seen.prompts[0]).toMatch(/5-hour limit: 3% used[^\n]* · resets at \d\d:\d\d \(in 5 h 0 min\)\n/)
+    expect(seen.prompts[0]).not.toContain('as of')
     expect(seen.prompts[0]).toContain('Go on.')
 
     const { argv, init } = seen.usageFetches[0]!
@@ -1265,7 +1266,7 @@ describe('server readings', () => {
     const clock = mock.clock(on, { now: NINE })
     seen.server.current = meter(30)
     const r = await refresh($)
-    expect(r).toMatch(/5-hour limit: 30% used · resets .* · fetched from the server at \d\d:\d\d/)
+    expect(r).toMatch(/5-hour limit: 30% used · resets at \d\d:\d\d \(in 2 h 0 min\)\n/)
     expect(await status($)).toContain('5-hour limit: 30% used, Δ ±0')
     const again = await refresh($)
     expect(again).toContain('No fresh reading from the server: the last one was asked for <1 min ago (at most every 30 s).')
@@ -1284,7 +1285,6 @@ describe('server readings', () => {
     seen.server.current = meter(10, { limits: undefined }) // no limits[]: the engine's cache
     const r = await refresh($)
     expect(r).toContain('5-hour limit: 85% used')
-    expect(r).not.toContain('fetched from the server')
     expect(r).toContain('No fresh reading from the server: only a cached answer')
 
     await clock.advance(6 * 60_000) // past the first back-off
@@ -1315,26 +1315,46 @@ describe('server readings', () => {
     const clock = mock.clock(on, { now: NINE })
     await start($, on)
     await $.tool.call({ tool: 'mcp__ctm__limit_wakeup', limit: 'five_hour', belowPercent: 50 } as never)
-    await clock.advance(20 * 60_000) // tries at 09:01, 09:06 (+5 min), 09:16 (+10 min)
+    await clock.advance(20 * 60_000) // tries at 09:00 (arming), 09:05 (+5 min), 09:15 (+10 min)
     expect(seen.usageFetches.length).toBe(3)
-    expect(await refresh($)).toContain(
-      'No fresh reading from the server: the last attempt failed (the second claude exited with 1: failed); next try possible in 16 min.',
+    const r = await refresh($)
+    expect(r).toContain(
+      'No fresh reading from the server: the last attempt failed (the second claude exited with 1: failed); next try possible in 15 min.',
     )
+    expect(r).toContain('5-hour limit: 85% used') // the session's own, as the fallback
   })
 
-  test('a model response after the server reading wins', async ($, on) => {
-    const seen = world(on)
+  test('the server reading is the default, taken again once 3 min old; the last response is the fallback', async ($, on) => {
+    const seen = world(on) // the session's own reading: 23.5%
     on('turn.step', async function* (_$, e) {
       return { turnId: e.turnId, index: e.index, answer: 'ok', toolUses: [] } as never
     })
     const clock = mock.clock(on, { now: NINE })
+    let step = 0
+    const respond = async () => {
+      for await (const _ of $.turn.step({ turnId: 't1', index: step++, model: 'claude-opus-5-5', messageCount: 1 } as never)) void _
+    }
     seen.server.current = meter(30)
-    expect(await refresh($)).toContain('5-hour limit: 30% used')
+    expect(await status($)).toContain('5-hour limit: 30% used')
     await clock.advance(60_000)
-    for await (const _ of $.turn.step({ turnId: 't1', index: 0, model: 'claude-opus-5-5', messageCount: 1 } as never)) void _
+    await respond() // 09:01: a model response brings the session's own
+    seen.server.current = meter(31)
+    await clock.advance(60_000) // 09:02
+    expect(await status($)).toContain('5-hour limit: 30% used, Δ ±0') // still the server's; the next is not due yet
+    expect(seen.usageFetches.length).toBe(1)
+    await clock.advance(60_000) // 09:03
+    expect(await status($)).toContain('5-hour limit: 31% used, Δ +1 pt')
+    expect(seen.usageFetches.length).toBe(2)
+
+    seen.server.current = undefined // the server cannot be read any more
+    await clock.advance(4 * 60_000) // 09:07
+    expect(await status($)).toMatch(/5-hour limit: 31% used[^\n]* · as of \d\d:\d\d\n/)
+    await clock.advance(60_000)
+    await respond() // 09:08
+    await clock.advance(6 * 60_000) // 09:14: the server reading is over 10 min old, the response newer
     const r = await status($)
     expect(r).toContain('5-hour limit: 23.5% used')
-    expect(r).not.toContain('fetched from the server')
+    expect(r).not.toContain('as of')
   })
 
   test('after /login to another account: fresh numbers for it, no deltas against the old one', async ($, on) => {
@@ -1347,15 +1367,17 @@ describe('server readings', () => {
     })
     const clock = mock.clock(on, { now: NINE })
     await start($, on)
-    seen.server.current = meter(5)
-    await $.prompt.submit({ text: 'go on' } as never)
-    expect(seen.usageFetches.length).toBe(0) // same account: nothing to fetch
+    seen.server.current = meter(20)
+    const r0 = (await $.prompt.submit({ text: 'go on' } as never)).context?.join('\n') ?? ''
+    expect(r0).toContain('5-hour limit: 20% used')
+    expect(seen.usageFetches.length).toBe(1)
 
     who.current = 'acct-2'
-    await clock.advance(60_000)
+    seen.server.current = meter(5)
+    await clock.advance(60_000) // not due yet for the same account – but this is another one
     const r = (await $.prompt.submit({ text: 'go on' } as never)).context?.join('\n') ?? ''
-    expect(seen.usageFetches.length).toBe(1)
-    expect(r).toMatch(/5-hour limit: 5% used · resets .* · fetched from the server/) // no Δ against acct-1
+    expect(seen.usageFetches.length).toBe(2)
+    expect(r).toMatch(/5-hour limit: 5% used · resets/) // no Δ against acct-1
 
     who.current = 'acct-3'
     seen.server.current = undefined

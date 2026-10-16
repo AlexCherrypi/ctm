@@ -22,7 +22,10 @@ Context window: 327k of 1.00M tokens used (33%), Δ +12k · auto-compact at 967k
   left.
 - **5-hour / 7-day limit**: the account's rate limits in percent and their reset. Claude Code
   does not expose the size of a window or the plan, and CTM does not estimate it. The limits
-  are account-wide, so their Δ includes every parallel session.
+  are account-wide, so their Δ includes every parallel session. CTM reads them from the server
+  at most every 3 minutes (see [Readings from the server](#readings-from-the-server)); a line
+  ending in `as of HH:MM` is an older reading because a newer one failed. Where the server cannot
+  be read, they come from the model's last response.
 - **Δ**: one per figure – context in tokens, each limit in points – always for that one window
   only, never a running total. `Δ window reset …` means the limit window reset inside it.
   Nothing is kept across sessions.
@@ -49,7 +52,8 @@ The model gets this legend once, in the CTM part of its system prompt (cached).
 
 ## Tools for the model
 
-- `mcp__ctm__status` – the current figures on demand.
+- `mcp__ctm__status` `{ refresh? }` – the current figures on demand; `refresh: true` reads the
+  5-hour / 7-day limits anew from the server first (a few seconds, no tokens; at most every 30 s).
 - `mcp__ctm__idle_updates` `{ enabled, maxMinutes? }` – idle updates on/off for this session.
 - `mcp__ctm__settings` `{ intervalMinutes?, compactThreshold?, fiveHourPauseAt?, sevenDayPauseAt? }` –
   shows (no arguments) or changes the settings; `null` puts one back to its default. From a
@@ -145,10 +149,11 @@ settings, or arms or fires a limit wake-up.
 - **Limit wake-up**: while the model is idle, CTM checks every `intervalMinutes` whether the limit
   is back below the mark – because its window reset, or because it dropped – and then wakes the
   model with a message (plus its own note). The model can also arm one on its own, e.g. "wake me
-  when the 5-hour window has reset". Rate limits arrive with responses, so while the model pauses
-  CTM treats a window whose reset time has passed as reset – also when the limit drops out of the
-  readings after its reset. Right when a known reset time passes, CTM checks at once instead of
-  waiting for the next interval.
+  when the 5-hour window has reset". Each check goes by the server reading (see below); where
+  that does not work, CTM falls back to the last reading the session has and treats a window
+  whose reset time has passed as reset – also when the limit drops out of the readings after its
+  reset. Right when a known reset time passes, CTM checks at once instead of waiting for the next
+  interval.
 - **Subagents**: get the blocks like the main agent, with their own wording: they cannot end their
   turn and be woken (their turn ending is their end), so they wait inside `limit_wakeup`. To give a subagent **its own
   pause thresholds**, put e.g. `[CTM limits: 5h=70 7d=90]` into its prompt (one of the two is
@@ -206,6 +211,35 @@ claude --plugin-dir /path/to/ctm
 
 Requires Claude Code v2.1.287 or later (desktop app v2.1.286). Rate limits are reported only
 when signed in with a claude.ai subscription, and only after the first response in a session.
+
+## Readings from the server
+
+The 5-hour / 7-day limits come from the server by default. Claude Code's own reading comes only
+with the headers of model responses: while the session is idle it stays frozen, usage from other
+sessions or devices on the same account stays unseen, and right after `/login` to another
+account the numbers are the old account's. That reading is the fallback.
+
+CTM asks a second, short-lived `claude` for the account's usage meter – the SDK's `get_usage`
+control request, the same fetch `/usage` does (`GET /api/oauth/usage`). Nothing goes to a model
+and it costs no tokens; it takes about 3 s and briefly a second `claude` process.
+
+- **When**: before a block, once the last server reading is 3 minutes old (so a block waits up
+  to ~3 s at most every 3 minutes), before each limit wake-up check and idle update, on demand
+  with `mcp__ctm__status` `refresh: true` (at most every 30 s), and right after `/login` to
+  another account (with your next prompt; the account comes from `oauthAccount.accountUuid` in
+  `~/.claude.json`). Until there is a reading for the new account the block says so instead of
+  showing the old account's numbers, and it shows no Δ against them.
+- **Only real answers**: the child runs with `--setting-sources project` (no user plugins or
+  hooks, so no second CTM) and with `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` empty (set, the
+  fetch fails silently and the answer comes from a cache up to an hour old). An answer without
+  `rate_limits.limits[]`, or whose `seven_day_breakdown.as_of` is older than 10 minutes, is such
+  a cached one and is not used.
+- **Fallback**: the endpoint answers 429 when asked too often, so after a failure CTM waits 5
+  minutes, doubling up to an hour (an hour at once for a login without rate limits). Meanwhile a
+  server reading is shown – marked `as of HH:MM` – while it is at most 10 minutes old or no model
+  response came since; after that the session's own reading from the last response. Where no
+  second `claude` can run or has no claude.ai login of its own (e.g. a cloud session, whose login
+  the host manages), CTM keeps working with the session's own readings.
 
 ## Notes
 

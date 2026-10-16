@@ -39,6 +39,17 @@ const INIT_STDOUT = [
   '',
 ].join('\n')
 
+// The account's usage meter as a second `claude` answers the SDK's get_usage request;
+// `rateLimits` null: a login without rate limits.
+function usageStdout(rateLimits: unknown): string {
+  const response = { session: { total_cost_usd: 0 }, rate_limits_available: rateLimits !== null, rate_limits: rateLimits }
+  return [
+    JSON.stringify({ type: 'system', subtype: 'ui_status', text: 'x' }),
+    JSON.stringify({ type: 'control_response', response: { subtype: 'success', request_id: 'ctm', response } }),
+    '',
+  ].join('\n')
+}
+
 type WorldOpts = {
   headless?: boolean
   lockedModel?: boolean
@@ -61,9 +72,19 @@ function world(on: On, initial: Usage = USAGE, opts: WorldOpts = {}) {
     model,
     checks: [] as string[],
     spawns: [] as string[][],
+    // What the usage meter answers (its rate_limits); undefined: the call fails.
+    server: { current: undefined as unknown },
+    usageFetches: [] as { argv: string[]; init: { stdin?: string; env?: Record<string, string> } }[],
   }
   on('process.run', (_$, e) => {
-    const argv = (e as unknown as { argv: string[] }).argv
+    const { argv, init } = e as unknown as { argv: string[]; init?: { stdin?: string } }
+    if (init?.stdin?.includes('"get_usage"')) {
+      seen.usageFetches.push({ argv, init })
+      const answer = seen.server.current
+      return {
+        value: answer === undefined ? { exitCode: 1, stdout: '', stderr: 'failed' } : { exitCode: 0, stdout: usageStdout(answer), stderr: '' },
+      } as never
+    }
     seen.spawns.push(argv)
     return { value: { exitCode: opts.catalog ? 0 : 1, stdout: opts.catalog ? INIT_STDOUT : '', stderr: '' } } as never
   })
@@ -1191,5 +1212,156 @@ describe('subagents and soft pauses', () => {
     const r = await call
     expect(String(r.result)).toMatch(/the 5-hour limit is below 80% again \(its window reset at 11:00\)\. Carry on/)
     expect(String(r.result)).toContain('Go on.')
+  })
+})
+
+describe('server readings', () => {
+  const NINE = Date.parse('2026-10-08T09:00:00.000Z')
+  const HIGH: Usage = {
+    context: { tokens: 84_000, window: 200_000, percent: 42 },
+    rateLimits: [
+      { kind: 'five_hour', percentUsed: 85, resetsAt: '2026-10-08T11:00:00.000Z' },
+      { kind: 'seven_day', percentUsed: 41.2, resetsAt: '2026-10-12T09:00:00.000Z' },
+    ],
+  }
+  // rate_limits as the meter answers when it reached the server (limits[] is there).
+  const meter = (five: number, extra: Record<string, unknown> = {}) => ({
+    five_hour: { utilization: five, resets_at: '2026-10-08T11:00:00.000Z' },
+    seven_day: { utilization: 41.2, resets_at: '2026-10-12T09:00:00.000Z' },
+    limits: [{ kind: 'five_hour' }, { kind: 'seven_day' }],
+    ...extra,
+  })
+  const refresh = async ($: Engine) => String((await $.tool.call({ tool: 'mcp__ctm__status', refresh: true } as never)).result)
+  const start = async ($: Engine, on: On) => {
+    on('session.start', () => ({ cwd: '/' }) as never)
+    await $.session.start({ cwd: '/' } as never)
+  }
+
+  test('a wake-up goes by the real server value, read without a model request', async ($, on) => {
+    const seen = world(on, HIGH)
+    mock.store(on, { settings: { compactThreshold: 'off', intervalMinutes: 60, pauseAt: { five_hour: 80 } } })
+    const clock = mock.clock(on, { now: NINE })
+    await start($, on)
+    seen.server.current = meter(85)
+    await $.tool.call({ tool: 'mcp__ctm__limit_wakeup', limit: 'five_hour', note: 'Go on.' } as never)
+    await clock.advance(119 * 60_000) // 10:59
+    expect(seen.prompts).toHaveLength(0)
+    expect(seen.usageFetches.length).toBe(1) // the interval check at 10:00
+    seen.server.current = meter(3, { five_hour: { utilization: 3, resets_at: '2026-10-08T16:00:00.000Z' } })
+    await clock.advance(60_000) // 11:00: the new window, as the server counts it
+    expect(seen.prompts).toHaveLength(1)
+    expect(seen.prompts[0]).toMatch(/the 5-hour limit is below 80% again \(it is at 3%\)/)
+    expect(seen.prompts[0]).toMatch(/5-hour limit: 3% used.* · fetched from the server at \d\d:\d\d/)
+    expect(seen.prompts[0]).toContain('Go on.')
+
+    const { argv, init } = seen.usageFetches[0]!
+    expect(argv).toEqual(expect.arrayContaining(['-p', '--no-session-persistence', '--strict-mcp-config', '--setting-sources', 'project']))
+    expect(JSON.parse(init.stdin!).request).toEqual({ subtype: 'get_usage', skip_behaviors: true })
+    expect(init.env).toEqual({ CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '' })
+  })
+
+  test('status refresh=true reads the server on demand, at most every 30 s', async ($, on) => {
+    const seen = world(on)
+    const clock = mock.clock(on, { now: NINE })
+    seen.server.current = meter(30)
+    const r = await refresh($)
+    expect(r).toMatch(/5-hour limit: 30% used · resets .* · fetched from the server at \d\d:\d\d/)
+    expect(await status($)).toContain('5-hour limit: 30% used, Δ ±0')
+    const again = await refresh($)
+    expect(again).toContain('No fresh reading from the server: the last one was asked for <1 min ago (at most every 30 s).')
+    expect(seen.usageFetches.length).toBe(1)
+
+    seen.server.current = null // a login without rate limits
+    await clock.advance(31_000)
+    const none = await refresh($)
+    expect(none).toContain('No fresh reading from the server: this login has no rate limits to read.')
+    expect(none).toContain('5-hour limit: 30% used') // the last good reading stays
+  })
+
+  test('a cached answer does not pass as fresh', async ($, on) => {
+    const seen = world(on, HIGH)
+    const clock = mock.clock(on, { now: NINE })
+    seen.server.current = meter(10, { limits: undefined }) // no limits[]: the engine's cache
+    const r = await refresh($)
+    expect(r).toContain('5-hour limit: 85% used')
+    expect(r).not.toContain('fetched from the server')
+    expect(r).toContain('No fresh reading from the server: only a cached answer')
+
+    await clock.advance(6 * 60_000) // past the first back-off
+    seen.server.current = meter(10, { seven_day_breakdown: { as_of: '2026-10-08T08:00:00.000Z' } }) // an hour old
+    expect(await refresh($)).toContain('only a cached answer')
+
+    await clock.advance(11 * 60_000) // 09:17, past the second back-off
+    seen.server.current = meter(10, { seven_day_breakdown: { as_of: '2026-10-08T09:17:00.000Z' } })
+    expect(await refresh($)).toContain('5-hour limit: 10% used')
+  })
+
+  test('while idle it asks at most every 3 minutes', async ($, on) => {
+    const seen = world(on, HIGH)
+    mock.store(on, { settings: { compactThreshold: 'off', intervalMinutes: 1 } })
+    const clock = mock.clock(on, { now: NINE })
+    await start($, on)
+    seen.server.current = meter(85)
+    await $.tool.call({ tool: 'mcp__ctm__limit_wakeup', limit: 'five_hour', belowPercent: 50 } as never)
+    await clock.advance(10 * 60_000)
+    expect(seen.prompts).toHaveLength(0)
+    expect(seen.usageFetches.length).toBeGreaterThanOrEqual(3)
+    expect(seen.usageFetches.length).toBeLessThanOrEqual(4)
+  })
+
+  test('after a failure it backs off, doubling', async ($, on) => {
+    const seen = world(on, HIGH)
+    mock.store(on, { settings: { compactThreshold: 'off', intervalMinutes: 1 } })
+    const clock = mock.clock(on, { now: NINE })
+    await start($, on)
+    await $.tool.call({ tool: 'mcp__ctm__limit_wakeup', limit: 'five_hour', belowPercent: 50 } as never)
+    await clock.advance(20 * 60_000) // tries at 09:01, 09:06 (+5 min), 09:16 (+10 min)
+    expect(seen.usageFetches.length).toBe(3)
+    expect(await refresh($)).toContain(
+      'No fresh reading from the server: the last attempt failed (the second claude exited with 1: failed); next try possible in 16 min.',
+    )
+  })
+
+  test('a model response after the server reading wins', async ($, on) => {
+    const seen = world(on)
+    on('turn.step', async function* (_$, e) {
+      return { turnId: e.turnId, index: e.index, answer: 'ok', toolUses: [] } as never
+    })
+    const clock = mock.clock(on, { now: NINE })
+    seen.server.current = meter(30)
+    expect(await refresh($)).toContain('5-hour limit: 30% used')
+    await clock.advance(60_000)
+    for await (const _ of $.turn.step({ turnId: 't1', index: 0, model: 'claude-opus-5-5', messageCount: 1 } as never)) void _
+    const r = await status($)
+    expect(r).toContain('5-hour limit: 23.5% used')
+    expect(r).not.toContain('fetched from the server')
+  })
+
+  test('after /login to another account: fresh numbers for it, no deltas against the old one', async ($, on) => {
+    const seen = world(on)
+    const who = { current: 'acct-1' }
+    on('env.get', (_$, e) => ({ value: (e as unknown as { name: string }).name === 'HOME' ? '/home/u' : undefined }) as never)
+    on('fs.read', (_$, e) => {
+      if ((e as unknown as { path: string }).path !== '/home/u/.claude.json') throw new Error('ENOENT')
+      return { value: JSON.stringify({ oauthAccount: { accountUuid: who.current, emailAddress: 'x' } }) } as never
+    })
+    const clock = mock.clock(on, { now: NINE })
+    await start($, on)
+    seen.server.current = meter(5)
+    await $.prompt.submit({ text: 'go on' } as never)
+    expect(seen.usageFetches.length).toBe(0) // same account: nothing to fetch
+
+    who.current = 'acct-2'
+    await clock.advance(60_000)
+    const r = (await $.prompt.submit({ text: 'go on' } as never)).context?.join('\n') ?? ''
+    expect(seen.usageFetches.length).toBe(1)
+    expect(r).toMatch(/5-hour limit: 5% used · resets .* · fetched from the server/) // no Δ against acct-1
+
+    who.current = 'acct-3'
+    seen.server.current = undefined
+    await clock.advance(60_000)
+    const r2 = (await $.prompt.submit({ text: 'go on' } as never)).context?.join('\n') ?? ''
+    expect(r2).toContain('Rate limits: account switched – no reading for the new account yet')
+    expect(r2).not.toContain('5-hour limit')
   })
 })

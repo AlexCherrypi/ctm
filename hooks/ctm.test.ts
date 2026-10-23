@@ -555,6 +555,56 @@ test('the CTM briefing is in the system prompt', async ($, on) => {
   expect(ctm?.text).not.toMatch(/first report|cache read|session cost/i)
 })
 
+describe('where an organization keeps plugins out of the system prompt', () => {
+  const answer = async function* (_$: unknown, e: { turnId: string; index: number }) {
+    return { turnId: e.turnId, index: e.index, answer: 'ok', toolUses: [], stopReason: 'end_turn', usage: null } as never
+  }
+  const step = async ($: Engine) => {
+    for await (const _ of $.turn.step({ turnId: 't1', index: 0, model: 'claude-opus-5-5', messageCount: 1 } as never)) void _
+  }
+  const read = async ($: Engine) => (await $.tool.call({ tool: 'Read', file_path: '/a' } as never)).context?.join('\n')
+
+  test('the briefing comes with the next block after a model request, once', async ($, on) => {
+    world(on)
+    on('turn.step', answer as never)
+    on('tool.call', { tool: 'Read' }, () => ({ result: 'content' }) as never)
+    mock.clock(on, { now: 10 * 60_000 })
+    expect(await status($)).not.toContain('CTM briefing') // no model request yet: prompt.compose may still come
+    await step($) // it went out, and prompt.compose did not reach CTM
+    const first = (await read($)) ?? ''
+    expect(first).toMatch(/^CTM briefing – it is not in your system prompt here/)
+    expect(first).toContain('mcp__ctm__limit_wakeup')
+    expect(first).toMatch(/\n\[CTM · .* · work update · /)
+    expect(await read($)).toBeUndefined() // once, then the interval as before
+    expect(await status($)).not.toContain('CTM briefing')
+  })
+
+  test('and again once the context started over', async ($, on) => {
+    const seen = world(on)
+    on('turn.step', answer as never)
+    mock.clock(on, { now: 10 * 60_000 })
+    await step($)
+    expect(await status($)).toContain('CTM briefing')
+    seen.usage.current = { ...USAGE, context: { tokens: 30_000, window: 200_000, percent: 15 } } // compacted: 84k -> 30k
+    expect(await status($)).toContain('CTM briefing')
+    expect(await status($)).not.toContain('CTM briefing')
+    await $.session.end({ reason: 'clear', sessionId: 's' } as never)
+    expect(await status($)).toContain('CTM briefing')
+  })
+
+  test('where prompt.compose reaches CTM, no block carries it', async ($, on) => {
+    world(on)
+    on('prompt.compose', () => ({ sections: [] }) as never)
+    on('turn.step', answer as never)
+    on('tool.call', { tool: 'Read' }, () => ({ result: 'content' }) as never)
+    mock.clock(on, { now: 10 * 60_000 })
+    await $.prompt.compose({ model: 'm', promptModel: 'm', surfaces: [], tools: [], outputStyle: null, traits: [] } as never)
+    await step($)
+    expect((await read($)) ?? '').not.toContain('CTM briefing')
+    expect(await status($)).not.toContain('CTM briefing')
+  })
+})
+
 describe('settings', () => {
   test('the model changes the interval; work updates follow it', async ($, on) => {
     world(on)

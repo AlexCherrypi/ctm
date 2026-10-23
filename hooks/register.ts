@@ -12,7 +12,9 @@ import type { IdleWatch, KeptIdleUpdates, KeptWakeups, LimitKind, LimitWatch } f
 // 2. Lets the model compact or clear its own conversation – only with a resume
 //    prompt, and a compact only with instructions for the summary.
 // 3. A short CTM briefing sits in the system prompt for good (it survives compact
-//    and clear) and is sent once more after every CTM reset.
+//    and clear) and is sent once more after every CTM reset. Where an organization
+//    manages Claude Code and keeps plugins out of the system prompt, the main agent's
+//    blocks carry it instead: once, and again after the context started over.
 // 4. Lets the model see its own model and effort and the models it can switch to (with
 //    the engine's own descriptions where it can get them), and switch model and/or
 //    effort (on its own or together with a compact or clear) – again with a resume prompt.
@@ -140,6 +142,12 @@ let lastDrop: string | null = null // why the engine last dropped one of CTM's o
 let resave = false // after /clear: the session id changed, so the kept values are written anew
 // The process a waiting subagent sleeps in; null: none runs here; undefined: not probed yet.
 let sleeper: string[] | null | undefined
+// Where an organization manages Claude Code, the hooks of plugins a person installed do not
+// run on prompt.compose (nor session.compact): the briefing then never reaches the system
+// prompt, and the main agent's blocks carry it instead.
+let composed = false // CTM's prompt.compose hook ran: the briefing is in the system prompt
+let stepped = false // a main model request went out, so prompt.compose had its chance
+let briefed = false // a block carried the briefing since the context last started over
 let serverReading: ServerReading | null = null // the last good reading from the server
 let usageFetch: Promise<void> | null = null // a server reading in flight
 let lastUsageTryAt = Number.NEGATIVE_INFINITY
@@ -159,6 +167,10 @@ let effortCooldownMs = 10 * MINUTE // between two effort changes
 let attachToPrompts = true
 let configuredTimeZone = ''
 let timeZone: string | null = null // resolved on the first report
+
+const BRIEFING_HEAD =
+  'CTM briefing – it is not in your system prompt here (the organization that manages Claude Code keeps plugins out ' +
+  'of it), so it comes with this block:'
 
 const INFO = [
   '# CTM – Context and Token Manager',
@@ -822,7 +834,7 @@ async function refreshWhileWaited($: EngineInterface): Promise<void> {
 // `recipient` is whoever reads this block ('main' or a subagent's id); deltas are
 // measured against the previous report that same recipient got. It takes no server
 // reading itself: the callers that may wait for one take it first.
-async function report($: EngineInterface, reason: string, recipient = 'main'): Promise<string> {
+async function report($: EngineInterface, reason: string, recipient = 'main', { noBrief = false } = {}): Promise<string> {
   await ensureTimeZone($)
   await ensureSettings($)
   const now = await $.clock.now()
@@ -830,6 +842,7 @@ async function report($: EngineInterface, reason: string, recipient = 'main'): P
   const prev = previousReport.get(recipient)
   const c = u.context
   const threshold = c.breakdown?.autoCompactThreshold
+  const brief = recipient === 'main' && !noBrief && briefingDue(c.tokens, prev?.contextTokens)
 
   const window = prev
     ? `Δ = change since previous report ${fmtAt(prev.at, now)}, ${fmtSpan(prev.at, now)} ago`
@@ -921,7 +934,22 @@ async function report($: EngineInterface, reason: string, recipient = 'main'): P
   }
 
   previousReport.set(recipient, { at: now, contextTokens: c.tokens ?? null, limits, marks })
-  return lines.join('\n')
+  if (!brief) return lines.join('\n')
+  briefed = true
+  return [BRIEFING_HEAD, INFO, '', ...lines].join('\n')
+}
+
+// Whether the main agent's next block carries the briefing: where a model request went out
+// without CTM's prompt.compose hook running, once – and again once the context started
+// over (a compaction shrinks it to under half; /clear resets `briefed`).
+function briefingPending(): boolean {
+  return !composed && stepped && !briefed
+}
+
+function briefingDue(tokens: number | undefined, before: number | null | undefined): boolean {
+  if (composed || !stepped) return false
+  if (briefed && tokens !== undefined && before != null && before >= 20_000 && tokens < before / 2) briefed = false
+  return !briefed
 }
 
 // A pause mark passed that the recipient's last block did not ask to pause for: the next
@@ -1167,6 +1195,7 @@ function describeJob(job: { mode: Mode | null; model: string | null; effort: str
 }
 
 async function resetMessage($: EngineInterface, job: PendingReset, note: string): Promise<string> {
+  briefed = true // it carries the briefing itself
   const model = (await safe(() => $.session.model())) ?? null
   const effort = await currentEffort($)
   return [
@@ -1178,7 +1207,7 @@ async function resetMessage($: EngineInterface, job: PendingReset, note: string)
     '--- Your resume prompt ---',
     job.resumePrompt,
     '',
-    await report($, `after ${describeJob(job)}`),
+    await report($, `after ${describeJob(job)}`, 'main', { noBrief: true }),
   ].join('\n')
 }
 
@@ -1537,6 +1566,9 @@ export const register: Register = (on, options) => {
   resave = false
   lastDrop = null
   sleeper = undefined
+  composed = false
+  stepped = false
+  briefed = false
   serverReading = null
   usageFetch = null
   lastUsageTryAt = Number.NEGATIVE_INFINITY
@@ -1821,6 +1853,7 @@ export const register: Register = (on, options) => {
   })
 
   on('session.end', async ($, e, next) => {
+    briefed = false // the context starts over
     if (e.reason === 'clear') {
       // /clear only ends the session formally; timer and state stay, kept under the new id.
       resave = true
@@ -1869,6 +1902,7 @@ export const register: Register = (on, options) => {
 
   // Permanent briefing in the system prompt: there from the start, survives compact and clear.
   on('prompt.compose', async ($, e, next) => {
+    composed = true
     const r = await next(e)
     return { sections: [...r.sections, { id: 'ctm:info', text: INFO, scope: 'session' as const }] }
   }).catch(($, e, next) => next(e))
@@ -2167,6 +2201,7 @@ export const register: Register = (on, options) => {
       if (e.effort !== undefined) lastEffort = String(e.effort)
     }
     const r = yield* next(e)
+    if (!e.agentId) stepped = true
     if (r.stopReason !== null) lastResponseAt = await $.clock.now() // a response came: the host's own limit reading is from now
     return r
   })
@@ -2188,7 +2223,8 @@ export const register: Register = (on, options) => {
 
   // ---------------------------------------------------------------- Figures while working
 
-  // At most every interval – and at once when a pause mark is newly passed. It takes no
+  // At most every interval – and at once when a pause mark is newly passed, or when the
+  // briefing has to come with a block (see `composed`). It takes no
   // server reading: while the model works, every response brings a fresh one.
   on('tool.call', async ($, e, next) => {
     const r = await next(e)
@@ -2197,9 +2233,10 @@ export const register: Register = (on, options) => {
     const recipient = e.agentId ?? 'main'
     const now = await $.clock.now()
     const due = now - (lastSent.get(recipient) ?? 0) >= intervalMs()
-    if (!due && !(await newlyPastMark($, recipient, now))) return r
+    const marked = !due && (await newlyPastMark($, recipient, now))
+    if (!due && !marked && !(recipient === 'main' && briefingPending())) return r
     lastSent.set(recipient, now)
-    return { ...r, context: [...(r.context ?? []), await report($, due ? 'work update' : 'limit update', recipient)] }
+    return { ...r, context: [...(r.context ?? []), await report($, marked ? 'limit update' : 'work update', recipient)] }
   }).catch(($, e, next) => next(e))
 
   // ---------------------------------------------------------------- The person's prompts

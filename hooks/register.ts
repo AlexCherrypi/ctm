@@ -76,6 +76,11 @@ const T_WAKEUP = 'mcp__ctm__limit_wakeup'
 const T_MODELS = 'mcp__ctm__models'
 const T_SWITCH = 'mcp__ctm__switch_model'
 const T_EFFORT = 'mcp__ctm__set_effort'
+// The account-switcher plugin's tools: where it is installed, a block past a pause mark
+// points the main agent to another of the person's accounts before asking it to pause.
+const T_SWITCHER_ACCOUNTS = 'mcp__account-switcher__accounts'
+const T_SWITCHER_SWITCH = 'mcp__account-switcher__switch'
+const SWITCHER_CHECK_MS = 60_000
 const EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max', 'auto']
 const STORE_SETTINGS = 'settings'
 const NAG_EVERY_MS = 30 * 60_000
@@ -159,6 +164,7 @@ let usageError: string | null = null // why the last server reading failed
 let lastResponseAt = Number.NEGATIVE_INFINITY // the last model response: it brings the host's own reading
 let account: string | null | undefined // the signed-in account (oauthAccount.accountUuid); undefined = not read yet
 let accountSwitchedAt = Number.NEGATIVE_INFINITY
+let switcher: { at: number; present: boolean } | null = null // whether the account switcher's tools are there
 
 // From userConfig, set in register
 let configIntervalMinutes = 3
@@ -849,6 +855,7 @@ async function report($: EngineInterface, reason: string, recipient = 'main', { 
   const now = await $.clock.now()
   const u = await $.session.usage({ breakdown: 'summary' })
   const prev = previousReport.get(recipient)
+  const canSwitch = recipient === 'main' && (await switcherPresent($, now))
   const c = u.context
   const threshold = c.breakdown?.autoCompactThreshold
   const brief = recipient === 'main' && !noBrief && briefingDue(c.tokens, prev?.contextTokens)
@@ -914,7 +921,7 @@ async function report($: EngineInterface, reason: string, recipient = 'main', { 
     }
     const agent = recipient === 'main' ? undefined : recipient
     for (const p of pastMarks(rateLimits, now, agent)) {
-      notes.push(pauseNote(p, now, agent))
+      notes.push(pauseNote(p, now, agent, canSwitch))
       marks.push(p.kind)
     }
   } else if (accountSwitchedAt > lastResponseAt) {
@@ -976,7 +983,7 @@ async function newlyPastMark($: EngineInterface, recipient: string, now: number)
 // What a block says past a pause mark – a request, never a hard stop: the main agent
 // pauses and arms a wake-up; a subagent cannot end its turn and be woken, so it waits
 // inside the wake-up call.
-function pauseNote(p: PastMark, now: number, agent?: string): string {
+function pauseNote(p: PastMark, now: number, agent?: string, canSwitch = false): string {
   const name = limitName(p.kind)
   const what = p.own
     ? `your ${agent && agentPauseAt.get(agent)?.[p.kind] !== undefined ? 'own ' : ''}pause threshold ${fmtPercent(p.mark)}`
@@ -993,11 +1000,23 @@ function pauseNote(p: PastMark, now: number, agent?: string): string {
   }
   const w = watches.get(p.kind)
   if (w) return `${name} is past ${what}; wake-up armed for below ${fmtPercent(w.below)} – stay paused until then.`
+  const instead = canSwitch
+    ? ` Before that: ${T_SWITCHER_ACCOUNTS} shows whether another of the user's accounts has room – if one has and ` +
+      `you may switch, switch to it (${T_SWITCHER_SWITCH}) at that clean point and carry on instead of pausing.`
+    : ''
   return (
     `${name} at ${fmtPercent(p.percent)} ≥ ${what}: please pause your work at the next clean point – first finish ` +
     `anything that must not be left half-done, then call ${T_WAKEUP} (limit "${p.kind}") and end your turn; you ` +
-    `will be woken once it is back below${resets}.`
+    `will be woken once it is back below${resets}.${instead}`
   )
+}
+
+// Whether the account-switcher plugin's tools are listed, looked up at most once a minute.
+async function switcherPresent($: EngineInterface, now: number): Promise<boolean> {
+  if (switcher && now - switcher.at < SWITCHER_CHECK_MS) return switcher.present
+  const tools = await safe(() => $.tool.list())
+  switcher = { at: now, present: Boolean(tools?.some(t => t.name === T_SWITCHER_SWITCH)) }
+  return switcher.present
 }
 
 // ---------------------------------------------------------------- Models
@@ -1619,6 +1638,7 @@ export const register: Register = (on, options) => {
   lastResponseAt = Number.NEGATIVE_INFINITY
   account = undefined
   accountSwitchedAt = Number.NEGATIVE_INFINITY
+  switcher = null
   cooldownMs = Math.max(0, Number(options.resetCooldownMinutes ?? 10)) * MINUTE
   effortCooldownMs = Math.max(0, Number(options.effortCooldownMinutes ?? 10)) * MINUTE
   attachToPrompts = options.attachToPrompts !== false

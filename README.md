@@ -181,6 +181,12 @@ settings, or arms or fires a limit wake-up.
   marks for helpers let the main agent go on a little longer than they do. A subagent can also set
   its own with the settings tool. Not possible with the plugin API today: compacting a subagent
   (Claude Code compacts it itself when it fills up) and a context figure per subagent.
+- **Several accounts** ([account switcher](https://github.com/AlexCherrypi/claude-account-switcher)):
+  where that plugin is installed (CTM checks for its tools at most once a minute), a block that
+  asks the main agent to pause first points it to `mcp__account-switcher__accounts`. If another
+  of your accounts has room and the model may switch, it moves there with
+  `mcp__account-switcher__switch` and carries on instead of pausing. After a switch CTM shows the
+  new account's figures, with no Δ against the old one.
 
 Whenever a setting changes, the answer carries the current figures right away: a threshold
 that is **already passed** when it is set (e.g. a compact threshold of 50k with 84k in the

@@ -1265,6 +1265,24 @@ describe('subagents and soft pauses', () => {
     expect(await status($)).toMatch(/please pause your work at the next clean point – first finish anything that must not be left half-done, then call mcp__ctm__limit_wakeup/)
   })
 
+  test('with the account switcher installed, the pause points to another account first', async ($, on) => {
+    world(on, HIGH)
+    mock.store(on, { settings: { compactThreshold: 'off', pauseAt: { five_hour: 80 } } })
+    mock.clock(on, { now: NINE })
+    on('tool.list', () => ({ value: [{ name: 'mcp__account-switcher__switch' }, { name: 'mcp__account-switcher__accounts' }] }) as never)
+    expect(await status($)).toMatch(/Before that: mcp__account-switcher__accounts shows whether another of the user's accounts has room – if one has and you may switch, switch to it \(mcp__account-switcher__switch\)/)
+    // A subagent cannot switch: it is told to wait as before.
+    expect(await status($, 'sub-1')).not.toMatch(/account-switcher/)
+  })
+
+  test('without the account switcher, no word of it', async ($, on) => {
+    world(on, HIGH)
+    mock.store(on, { settings: { compactThreshold: 'off', pauseAt: { five_hour: 80 } } })
+    mock.clock(on, { now: NINE })
+    on('tool.list', () => ({ value: [{ name: 'Bash' }] }) as never)
+    expect(await status($)).not.toMatch(/account-switcher/)
+  })
+
   test('a tool call is never held, even past the mark', async ($, on) => {
     world(on, HIGH)
     mock.store(on, { settings: { compactThreshold: 'off', pauseAt: { five_hour: 80 } } })

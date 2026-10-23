@@ -164,6 +164,7 @@ let usageError: string | null = null // why the last server reading failed
 let lastResponseAt = Number.NEGATIVE_INFINITY // the last model response: it brings the host's own reading
 let account: string | null | undefined // the signed-in account (oauthAccount.accountUuid); undefined = not read yet
 let accountSwitchedAt = Number.NEGATIVE_INFINITY
+let interactive = false // a person is at the prompt (session.start says)
 let switcher: { at: number; present: boolean } | null = null // whether the account switcher's tools are there
 
 // From userConfig, set in register
@@ -638,18 +639,37 @@ function fmtAt(ms: number, ref: number): string {
 // ticker (no budget) takes the readings anything waits on; a hook takes one itself only
 // for a block the person or the model asked for, and only when none is in flight.
 
-// The signed-in account, as ~/.claude.json names it; null where it cannot be read
-// (no claude.ai login, missing, over $.fs.read's 4 MiB, not JSON).
-async function readAccount($: EngineInterface): Promise<string | null> {
+// ~/.claude.json, parsed; null where it cannot be read (missing, over $.fs.read's 4 MiB,
+// not JSON).
+async function readConfig($: EngineInterface): Promise<Record<string, any> | null> {
   const dir = (await safe(() => $.env.get('CLAUDE_CONFIG_DIR'))) || (await safe(() => $.env.get('HOME')))
   if (!dir) return null
   const text = await safe(() => $.fs.read(`${dir.replace(/\/+$/, '')}/.claude.json`))
   try {
-    const id = typeof text === 'string' ? JSON.parse(text)?.oauthAccount?.accountUuid : undefined
-    return typeof id === 'string' && id ? id : null
+    const config = typeof text === 'string' ? JSON.parse(text) : null
+    return config && typeof config === 'object' ? config : null
   } catch {
     return null
   }
+}
+
+// The signed-in account, as ~/.claude.json names it; null where it cannot be read
+// (no claude.ai login, or the file cannot be read).
+async function readAccount($: EngineInterface): Promise<string | null> {
+  const id = (await readConfig($))?.oauthAccount?.accountUuid
+  return typeof id === 'string' && id ? id : null
+}
+
+// Whether the session itself runs on the API key in the environment, which the host
+// picks this way: -p and the SDK take it as it is (not under VS Code), a session with a
+// person at the prompt only once they let it – ~/.claude.json keeps the last 20
+// characters of each key they did. Where that cannot be read, as if it did.
+async function sessionUsesKey($: EngineInterface, key: string): Promise<boolean> {
+  if (!interactive && (await safe(() => $.env.get('CLAUDE_CODE_ENTRYPOINT'))) !== 'claude-vscode') return true
+  const config = await readConfig($)
+  if (!config) return true
+  const approved = config.customApiKeyResponses?.approved
+  return Array.isArray(approved) && approved.includes(key.trim().slice(-20))
 }
 
 // True when the account changed since the last look (a /login to another one): the
@@ -678,6 +698,10 @@ type UsageAnswer = { limits: ServerLimit[] } | { error: string; final?: boolean 
 
 async function fetchUsage($: EngineInterface): Promise<UsageAnswer> {
   const exe = (await safe(() => $.env.get('CLAUDE_CODE_EXECPATH'))) || 'claude'
+  // -p would take a key from the environment over the claude.ai login the session runs
+  // on, and answer that there are no rate limits.
+  const key = (await safe(() => $.env.get('ANTHROPIC_API_KEY')))?.trim()
+  const dropKey = !!key && !(await sessionUsesKey($, key))
   try {
     const r = await $.process.run(
       [
@@ -696,7 +720,7 @@ async function fetchUsage($: EngineInterface): Promise<UsageAnswer> {
       {
         stdin: `${JSON.stringify({ type: 'control_request', request_id: 'ctm', request: { subtype: 'get_usage', skip_behaviors: true } })}\n`,
         // Set, the fetch fails silently and the answer falls back to the cache (up to an hour old).
-        env: { CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '' },
+        env: { CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '', ...(dropKey ? { ANTHROPIC_API_KEY: '' } : {}) },
         timeoutMs: USAGE_TIMEOUT_MS,
       },
     )
@@ -1638,6 +1662,7 @@ export const register: Register = (on, options) => {
   lastResponseAt = Number.NEGATIVE_INFINITY
   account = undefined
   accountSwitchedAt = Number.NEGATIVE_INFINITY
+  interactive = false
   switcher = null
   cooldownMs = Math.max(0, Number(options.resetCooldownMinutes ?? 10)) * MINUTE
   effortCooldownMs = Math.max(0, Number(options.effortCooldownMinutes ?? 10)) * MINUTE
@@ -1880,6 +1905,7 @@ export const register: Register = (on, options) => {
     await ensureSettings($)
     ticker?.cancel()
     ticker = null
+    interactive = e.isInteractive === true
     await ensureRunning($)
     await checkAccount($)
     return next(e)
@@ -2265,9 +2291,12 @@ export const register: Register = (on, options) => {
       busy = true
       if (e.effort !== undefined) lastEffort = String(e.effort)
     }
+    const sentAt = await $.clock.now()
     const r = yield* next(e)
     if (!e.agentId) stepped = true
-    if (r.stopReason !== null) lastResponseAt = await $.clock.now() // a response came: the host's own limit reading is from now
+    // A response came: the host's own limit reading is from now – unless the request
+    // went out before an account switch, under the old account.
+    if (r.stopReason !== null && sentAt >= accountSwitchedAt) lastResponseAt = await $.clock.now()
     return r
   })
 

@@ -1516,6 +1516,79 @@ describe('server readings', () => {
     expect(r2).toContain('Rate limits: account switched – no reading for the new account yet')
     expect(r2).not.toContain('5-hour limit')
   })
+
+  test('the response to a request sent before an account switch is still the old account\'s', async ($, on) => {
+    const seen = world(on) // the session's own reading: 23.5%
+    const who = { current: 'acct-1' }
+    on('env.get', (_$, e) => ({ value: (e as unknown as { name: string }).name === 'HOME' ? '/home/u' : undefined }) as never)
+    on('fs.read', () => ({ value: JSON.stringify({ oauthAccount: { accountUuid: who.current } }) }) as never)
+    const held = { release: () => {} }
+    on('turn.step', async function* (_$, e) {
+      await new Promise<void>(r => (held.release = r))
+      return { turnId: e.turnId, index: e.index, answer: 'ok', toolUses: [], stopReason: 'end_turn', usage: null } as never
+    })
+    const clock = mock.clock(on, { now: NINE })
+    await start($, on)
+    const prompt = async () => (await $.prompt.submit({ text: 'go on' } as never)).context?.join('\n') ?? ''
+    let step = 0
+    const respond = async () => {
+      for await (const _ of $.turn.step({ turnId: 't1', index: step++, model: 'claude-opus-5-5', messageCount: 1 } as never)) void _
+    }
+    expect(await prompt()).toContain('5-hour limit: 23.5% used') // the server cannot be read: the session's own
+
+    const inFlight = respond() // goes out under acct-1
+    await clock.advance(1_000)
+    who.current = 'acct-2'
+    expect(await prompt()).toContain('Rate limits: account switched – no reading for the new account yet')
+    held.release()
+    await inFlight
+    await clock.advance(1_000)
+    expect(await prompt()).toContain('Rate limits: account switched – no reading for the new account yet')
+
+    const next = respond() // goes out under acct-2
+    await clock.advance(1_000)
+    held.release()
+    await next
+    expect(await prompt()).toContain('5-hour limit: 23.5% used')
+  })
+
+  test('the second claude leaves out an API key the session does not run on', async ($, on) => {
+    const seen = world(on)
+    const KEY = 'sk-ant-api03-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbbbbbb'
+    const env: Record<string, string | undefined> = { HOME: '/home/u', ANTHROPIC_API_KEY: KEY }
+    on('env.get', (_$, e) => ({ value: env[(e as unknown as { name: string }).name] }) as never)
+    const responses = { current: { approved: [] as string[], rejected: [KEY.slice(-20)] } }
+    const unreadable = { current: false }
+    on('fs.read', () => {
+      if (unreadable.current) throw new Error('EBUSY')
+      return { value: JSON.stringify({ oauthAccount: { accountUuid: 'acct-1' }, customApiKeyResponses: responses.current }) } as never
+    })
+    const clock = mock.clock(on, { now: NINE })
+    on('session.start', () => ({ cwd: '/' }) as never)
+    seen.server.current = meter(20)
+    const fetchEnv = async (isInteractive: boolean) => {
+      await $.session.start({ cwd: '/', surface: isInteractive ? 'terminal' : null, isInteractive } as never)
+      await clock.advance(31_000)
+      await refresh($)
+      return seen.usageFetches.at(-1)!.init.env
+    }
+    const kept = { CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '' }
+    const dropped = { ...kept, ANTHROPIC_API_KEY: '' }
+
+    expect(await fetchEnv(true)).toEqual(dropped) // declined at the prompt: the session runs on the claude.ai login
+    responses.current = { approved: [KEY.slice(-20)], rejected: [] }
+    expect(await fetchEnv(true)).toEqual(kept) // approved: the session runs on the key, and has no rate limits
+    responses.current = { approved: [], rejected: [] }
+    expect(await fetchEnv(false)).toEqual(kept) // -p and the SDK take the key as it is
+    env.CLAUDE_CODE_ENTRYPOINT = 'claude-vscode'
+    expect(await fetchEnv(false)).toEqual(dropped) // VS Code asks first, as the terminal does
+    unreadable.current = true
+    expect(await fetchEnv(true)).toEqual(kept) // what was approved cannot be read: as before
+    unreadable.current = false
+    env.ANTHROPIC_API_KEY = undefined
+    expect(await fetchEnv(true)).toEqual(kept) // no key, nothing to leave out
+    expect(seen.usageFetches).toHaveLength(6)
+  })
 })
 
 describe('wake-ups that must not get lost', () => {

@@ -257,8 +257,9 @@ and it costs no tokens; it takes about 3 s and briefly a second `claude` process
   account (with your next prompt; the account comes from `oauthAccount.accountUuid` in
   `~/.claude.json` – a file that cannot be read counts as no switch). Until there is a reading for
   the new account the block says so instead of showing the old account's numbers, and it shows no
-  Δ against them. While the model works, every response brings a fresh reading, so the work
-  updates on tool results never wait for the server.
+  Δ against them – also once the response to a request sent before the switch comes in, which
+  still went out under the old account. While the model works, every response brings a fresh
+  reading, so the work updates on tool results never wait for the server.
 - **Never at the cost of a hook's time**: a hook never waits for a reading another hook or the
   timer has in flight. Claude Code bounds each hook's own time and counts waiting for someone
   else's process against it; a hook that runs on past its time counts toward a runaway plugin,
@@ -268,6 +269,12 @@ and it costs no tokens; it takes about 3 s and briefly a second `claude` process
   `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` empty (set, the fetch fails silently and the answer
   comes from a cache up to an hour old). An answer without `rate_limits.limits[]`, or whose
   `seven_day_breakdown.as_of` is older than 10 minutes, is such a cached one and is not used.
+  `-p` takes an `ANTHROPIC_API_KEY` from the environment over the claude.ai login, so where the
+  session itself does not run on that key the child gets it empty. Claude Code takes the key in a
+  session with you at the prompt (terminal, VS Code) only once you approved it, and in `-p` and
+  the SDK as it is. CTM tells which by the key's last 20 characters against
+  `customApiKeyResponses.approved` in `~/.claude.json`, the way Claude Code does; the key itself
+  is read for nothing else and goes nowhere.
 - **Newest wins, with a fallback**: per limit, the server reading counts when its numbers are newer
   than the last model response (Claude Code may answer from a snapshot up to a minute old), else the
   session's own from that response. The endpoint answers 429

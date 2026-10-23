@@ -734,6 +734,12 @@ type UsageAnswer = { limits: ServerLimit[] } | { error: string; final?: boolean 
 
 async function fetchUsage($: EngineInterface): Promise<UsageAnswer> {
   const exe = (await safe(() => $.env.get('CLAUDE_CODE_EXECPATH'))) || 'claude'
+  // The usage meter is traffic Claude Code counts as nonessential: where the person turned
+  // that off, it is not read (the child would read it only with the setting undone, and
+  // send everything else nonessential with it).
+  if (await safe(() => $.env.get('CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC'))) {
+    return { error: 'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC is set, and the usage meter is nonessential traffic', final: true }
+  }
   // An apiKeyHelper in the settings: the session runs on its key, not on the claude.ai
   // login, which the child – reading no settings – would read the limits of.
   if (await safe(() => $.settings.read({ key: 'apiKeyHelper' }))) {
@@ -760,8 +766,7 @@ async function fetchUsage($: EngineInterface): Promise<UsageAnswer> {
       ],
       {
         stdin: `${JSON.stringify({ type: 'control_request', request_id: 'ctm', request: { subtype: 'get_usage', skip_behaviors: true } })}\n`,
-        // Set, the fetch fails silently and the answer falls back to the cache (up to an hour old).
-        env: { CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '', ...(dropKey ? { ANTHROPIC_API_KEY: '' } : {}) },
+        env: dropKey ? { ANTHROPIC_API_KEY: '' } : {},
         timeoutMs: USAGE_TIMEOUT_MS,
       },
     )

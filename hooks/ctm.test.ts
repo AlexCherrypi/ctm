@@ -1390,7 +1390,7 @@ describe('server readings', () => {
     const { argv, init } = seen.usageFetches[0]!
     expect(argv).toEqual(expect.arrayContaining(['-p', '--no-session-persistence', '--strict-mcp-config', '--setting-sources', '']))
     expect(JSON.parse(init.stdin!).request).toEqual({ subtype: 'get_usage', skip_behaviors: true })
-    expect(init.env).toEqual({ CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '' })
+    expect(init.env).toEqual({})
   })
 
   test('status refresh=true reads the server on demand, at most every 30 s', async ($, on) => {
@@ -1639,6 +1639,17 @@ describe('server readings', () => {
     expect(await prompt()).toContain('5-hour limit: 23.5% used')
   })
 
+  test('with nonessential traffic turned off the server is not asked', async ($, on) => {
+    const seen = world(on)
+    on('env.get', (_$, e) => ({ value: (e as unknown as { name: string }).name === 'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC' ? '1' : undefined }) as never)
+    mock.clock(on, { now: NINE })
+    seen.server.current = meter(20)
+    const r = await refresh($)
+    expect(r).toContain('No fresh reading from the server: CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC is set, and the usage meter is nonessential traffic.')
+    expect(r).toContain('5-hour limit: 23.5% used') // the session's own
+    expect(seen.usageFetches).toHaveLength(0)
+  })
+
   test('a session on an apiKeyHelper reads no limits from the server', async ($, on) => {
     const seen = world(on)
     on('settings.read', () => ({ value: { apiKeyHelper: '~/bin/anthropic-key.sh' } }) as never)
@@ -1670,8 +1681,8 @@ describe('server readings', () => {
       await refresh($)
       return seen.usageFetches.at(-1)!.init.env
     }
-    const kept = { CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '' }
-    const dropped = { ...kept, ANTHROPIC_API_KEY: '' }
+    const kept = {}
+    const dropped = { ANTHROPIC_API_KEY: '' }
 
     expect(await fetchEnv(true)).toEqual(dropped) // declined at the prompt: the session runs on the claude.ai login
     responses.current = { approved: [KEY.slice(-20)], rejected: [] }

@@ -268,10 +268,12 @@ and it costs no tokens; it takes about 3 s and briefly a second `claude` process
   else's process against it; a hook that runs on past its time counts toward a runaway plugin,
   and after two in a row Claude Code replaces the hooks worker.
 - **Only real answers**: the child runs with `--setting-sources ""` (no settings: no plugins or
-  hooks of yours or the project's, so no second CTM) and with
-  `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` empty (set, the fetch fails silently and the answer
-  comes from a cache up to an hour old). An answer without `rate_limits.limits[]`, or whose
-  `seven_day_breakdown.as_of` is older than 10 minutes, is such a cached one and is not used.
+  hooks of yours or the project's, so no second CTM). An answer without `rate_limits.limits[]`,
+  or whose `seven_day_breakdown.as_of` is older than 10 minutes, comes from Claude Code's cache
+  and is not used.
+- **Your opt-out holds**: Claude Code counts the usage meter as nonessential traffic. With
+  `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` set, CTM does not ask the server and goes by the
+  session's own readings.
   `-p` takes an `ANTHROPIC_API_KEY` from the environment over the claude.ai login, so where the
   session itself does not run on that key the child gets it empty. Claude Code takes the key in a
   session with you at the prompt (terminal, VS Code) only once you approved it, and in `-p` and

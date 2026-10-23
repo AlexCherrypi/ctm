@@ -77,6 +77,8 @@ const T_EFFORT = 'mcp__ctm__set_effort'
 const EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max', 'auto']
 const STORE_SETTINGS = 'settings'
 const NAG_EVERY_MS = 30 * 60_000
+// The compact threshold where neither the person nor the model set one (userConfig's default).
+const DEFAULT_COMPACT_THRESHOLD = '350k'
 // Built-in safety net: this close to a limit the blocks always ask the model to pause,
 // whatever is configured. Not a setting.
 const FALLBACK_PAUSE_AT: Record<LimitKind, number> = { five_hour: 95, seven_day: 97 }
@@ -150,7 +152,7 @@ let accountSwitchedAt = Number.NEGATIVE_INFINITY
 
 // From userConfig, set in register
 let configIntervalMinutes = 3
-let configCompactThreshold = ''
+let configCompactThreshold = DEFAULT_COMPACT_THRESHOLD
 let configPauseAt: Record<LimitKind, number> = { five_hour: 0, seven_day: 0 }
 let cooldownMs = 10 * MINUTE // between two resets or model switches
 let effortCooldownMs = 10 * MINUTE // between two effort changes
@@ -347,7 +349,9 @@ function readingIsStale(r: { resetsAt?: string }, now: number): boolean {
 function describeSettings(): string {
   const ct = compactThresholdSetting()
   const parsed = parseThreshold(ct)
-  const compact = ct === 'off' ? 'off (declined)' : parsed ? fmtThreshold(parsed) : 'not set (blocks remind you to ask)'
+  const isDefault = settings?.compactThreshold === undefined && ct === DEFAULT_COMPACT_THRESHOLD
+  const compact =
+    ct === 'off' ? 'off (declined)' : parsed ? `${fmtThreshold(parsed)}${isDefault ? ' (default)' : ''}` : 'not set (blocks remind you to ask)'
   const pause = (k: LimitKind) => (pauseAt(k) > 0 ? fmtPercent(pauseAt(k)) : 'off')
   const lines = [
     'CTM settings:',
@@ -1517,7 +1521,7 @@ async function changeAgentLimits($: EngineInterface, agent: string, change: Sett
 
 export const register: Register = (on, options) => {
   configIntervalMinutes = clampInterval(Number(options.intervalMinutes ?? 3) || 3)
-  configCompactThreshold = String(options.compactThreshold ?? '').trim().toLowerCase()
+  configCompactThreshold = String(options.compactThreshold ?? DEFAULT_COMPACT_THRESHOLD).trim().toLowerCase()
   const pct = (v: unknown) => Math.min(100, Math.max(0, Number(v ?? 0) || 0))
   configPauseAt = { five_hour: pct(options.fiveHourPauseAt), seven_day: pct(options.sevenDayPauseAt) }
   settings = null
@@ -1642,8 +1646,8 @@ export const register: Register = (on, options) => {
         `- intervalMinutes (1–${MAX_INTERVAL_MINUTES}): how often CTM blocks come while you work and, with idle ` +
         'updates on, while you are idle.\n' +
         '- compactThreshold: context size from which the blocks remind you to compact when your task allows it – ' +
-        'tokens ("300k", 300000) or a percent of the window ("30%"); "off" = the user does not want one (stops ' +
-        'the reminders to ask).\n' +
+        `tokens ("300k", 300000) or a percent of the window ("30%"); default ${DEFAULT_COMPACT_THRESHOLD}; "off" = the ` +
+        'user does not want one.\n' +
         '- fiveHourPauseAt / sevenDayPauseAt (percent, "off"): from this usage on, the blocks ask you to pause ' +
         `and wait for the limit with ${T_WAKEUP}.\n` +
         'A subagent can set only its own fiveHourPauseAt / sevenDayPauseAt: they apply to it alone.',

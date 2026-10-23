@@ -137,8 +137,9 @@ settings, or arms or fires a limit wake-up.
   `30%`): once the context passes it, every CTM block reminds the model to compact at the next
   clean point – *if its task allows it*, never in the middle of critical work. A smaller context
   makes every further request cheaper on the 5-hour and 7-day limits.
-  While it is **not set**, CTM nudges the model at most every 30 minutes to ask you whether to set
-  one. Set it to `off` if you don't want one – that stops the nudging.
+  **Default: 350k** – it applies wherever neither you nor the model set one. Set it to `off` if you
+  don't want one. Left empty in the options, it is unset: CTM then nudges the model at most every
+  30 minutes to ask you whether to set one.
 - **Pause thresholds** (`fiveHourPauseAt`, `sevenDayPauseAt`, in percent; off by default, no
   nudging): once a limit passes its threshold, every block asks the model to pause – **a request,
   never a hard stop**: it first finishes anything that must not be left half-done (a config file
@@ -196,7 +197,7 @@ The model is told when you change them.
 | Option | Default | Meaning |
 |---|---|---|
 | `intervalMinutes` | 3 | Interval of updates while working and while idle, and of the wake-up checks (1–60) |
-| `compactThreshold` | empty | `300k`, `30%`, `off`; empty = unset (the model is nudged to ask you) |
+| `compactThreshold` | 350k | `300k`, `30%`, `off`; empty = unset (the model is nudged to ask you) |
 | `fiveHourPauseAt` | 0 | Pause threshold for the 5-hour limit in percent, 0 = off |
 | `sevenDayPauseAt` | 0 | Pause threshold for the 7-day limit in percent, 0 = off |
 | `resetCooldownMinutes` | 10 | Minimum time between two compact/clear/model switches (one shared gap), 0 = none |

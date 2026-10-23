@@ -1,6 +1,6 @@
 {
   "name": "ctm",
-  "version": "0.10.1",
+  "version": "0.11.0",
   "description": "Context and Token Manager: keeps the model informed about its context window and the 5-hour / 7-day rate limits, each with its change since the last report, and lets it compact or clear itself, switch its own model or change its own effort – always with a resume prompt.",
   "author": {
     "name": "AlexCherrypi"
@@ -16,8 +16,8 @@
     "compactThreshold": {
       "type": "string",
       "title": "Compact threshold",
-      "description": "Context size from which CTM reminds the model to compact when its task allows: tokens (300k) or percent of the window (30%). 'off' = no threshold and no reminders to ask. Empty = unset: CTM nudges the model now and then to ask you for one. The model (settings tool) or /ctm compact can override it.",
-      "default": ""
+      "description": "Context size from which CTM reminds the model to compact when its task allows: tokens (350k) or percent of the window (30%). Default 350k. 'off' = no threshold and no reminders. Empty = unset: CTM nudges the model now and then to ask you for one. The model (settings tool) or /ctm compact can override it.",
+      "default": "350k"
     },
     "fiveHourPauseAt": {
       "type": "number",

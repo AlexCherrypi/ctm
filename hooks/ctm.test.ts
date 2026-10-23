@@ -605,7 +605,17 @@ describe('settings', () => {
 })
 
 describe('compact threshold', () => {
-  test('unset: the block now and then nudges to ask the user', async ($, on) => {
+  test('without any setting it is 350k', async ($, on) => {
+    world(on, { ...USAGE, context: { tokens: 360_000, window: 1_000_000, percent: 36 } })
+    mock.store(on)
+    mock.clock(on, { now: 0 })
+    const r = await status($)
+    expect(r).toMatch(/Compact threshold passed \(360k ≥ 350k\)/)
+    expect(r).not.toMatch(/No compact threshold set/)
+    expect(String((await $.tool.call({ tool: 'mcp__ctm__settings' } as never)).result)).toContain('compactThreshold: 350k (default)')
+  })
+
+  test('unset: the block now and then nudges to ask the user', { options: { compactThreshold: '' } }, async ($, on) => {
     world(on)
     mock.store(on)
     const clock = mock.clock(on, { now: 0 })

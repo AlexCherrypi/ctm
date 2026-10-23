@@ -13,12 +13,17 @@ export type IdleWatch = { until: number | null }
 // id of the session they belong to: another session in the same process never takes them.
 export type KeptWakeups = { session: string; watches: LimitWatch[] }
 export type KeptIdleUpdates = { session: string; idle: IdleWatch | null }
+// Whether CTM's prompt.compose hook ran in this session: where an organization that manages
+// Claude Code keeps plugins out of the system prompt it never does, and the blocks carry the
+// briefing instead. Kept so a fresh copy of the module does not take a quiet spell for that.
+export type KeptBriefing = { session: string; composed: boolean }
 
 declare module 'claude-code' {
   interface PluginState {
     ctm: {
       wakeups: KeptWakeups
       idleUpdates: KeptIdleUpdates
+      briefing: KeptBriefing
     }
   }
 }

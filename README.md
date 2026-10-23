@@ -44,7 +44,10 @@ The model gets this legend once, in the CTM part of its system prompt (cached).
 Where an organization manages Claude Code, the hooks of plugins you installed yourself do not run
 on `prompt.compose` (nor `session.compact`) – `/plugins` notes it under CTM. The system prompt
 then has no CTM part, so the main agent's next block after its first model request carries the
-legend instead, and again once the context started over (after a compaction or `/clear`). An
+legend instead, and again once the context started over (after a compaction or `/clear`). You get
+a toast once when that happens, and `/ctm` (or the settings tool) says where the briefing is. Where
+`session.compact` does not reach CTM, a `/compact` CTM runs as a command (headless hosts) is
+confirmed by measuring instead: the conversation the engine holds shrinks once it ran. An
 administrator can make CTM one of the organization's own plugins in managed settings; its
 legend is then in the system prompt as usual.
 

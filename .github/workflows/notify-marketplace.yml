@@ -3,7 +3,8 @@
 # webhook that makes claude.ai re-sync.
 # Each marketplace needs its own secret: a fine-grained token with
 # "Contents: read and write" on that marketplace repo. Without the secret the
-# step is skipped; the marketplace still picks the change up with its daily check.
+# step is skipped with a warning on the run; the marketplace still picks the
+# change up with its daily check (or run its "Sync plugin shas" by hand).
 name: Notify marketplaces
 
 on:
@@ -29,7 +30,7 @@ jobs:
           MARKETPLACE: ${{ matrix.marketplace }}
         run: |
           if [ -z "$TOKEN" ]; then
-            echo "::notice::${{ matrix.secret }} not set – skipping $MARKETPLACE"
+            echo "::warning::${{ matrix.secret }} not set – $MARKETPLACE was NOT notified (it picks the change up with its daily check)"
             exit 0
           fi
           curl -fsS -X POST \

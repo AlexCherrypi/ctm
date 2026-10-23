@@ -1,5 +1,5 @@
 import type { EngineInterface, Register } from 'claude-code'
-import type { IdleWatch, KeptIdleUpdates, KeptWakeups, LimitKind, LimitWatch } from '../types'
+import type { IdleWatch, KeptBriefing, KeptIdleUpdates, KeptWakeups, LimitKind, LimitWatch } from '../types'
 
 // CTM – Context and Token Manager
 //
@@ -101,6 +101,7 @@ const TICK_DEAD_MS = 3 * IDLE_TICK_MS // no tick for this long: the ticker is go
 const RESET_DELAY_MS = 1_000
 const COMPACT_CONFIRM_MS = 10 * 60_000
 const CLEAR_CONFIRM_MS = 2 * 60_000
+const COMPACT_POLL_MS = 5_000 // how often a /compact run as a command is checked for having shrunk the conversation
 const CHECK_TIMEOUT_MS = 30_000
 const CATALOG_TIMEOUT_MS = 20_000
 const CATALOG_TTL_MS = 15 * 60_000
@@ -148,6 +149,7 @@ let sleeper: string[] | null | undefined
 let composed = false // CTM's prompt.compose hook ran: the briefing is in the system prompt
 let stepped = false // a main model request went out, so prompt.compose had its chance
 let briefed = false // a block carried the briefing since the context last started over
+let toldNoCompose = false // the person was told the briefing comes with the blocks here
 let serverReading: ServerReading | null = null // the last good reading from the server
 let usageFetch: Promise<void> | null = null // a server reading in flight
 let lastUsageTryAt = Number.NEGATIVE_INFINITY
@@ -371,6 +373,13 @@ function describeSettings(): string {
     `- compactThreshold: ${compact}`,
     `- fiveHourPauseAt: ${pause('five_hour')}`,
     `- sevenDayPauseAt: ${pause('seven_day')}`,
+    `- briefing: ${
+      composed
+        ? 'in the system prompt'
+        : stepped
+          ? 'in the blocks – prompt.compose does not reach CTM here (an organization manages Claude Code; an administrator can make CTM one of its own plugins)'
+          : 'not known yet (no model request so far)'
+    }`,
   ]
   if (agentPauseAt.size > 0) {
     lines.push(
@@ -936,6 +945,10 @@ async function report($: EngineInterface, reason: string, recipient = 'main', { 
   previousReport.set(recipient, { at: now, contextTokens: c.tokens ?? null, limits, marks })
   if (!brief) return lines.join('\n')
   briefed = true
+  if (!toldNoCompose) {
+    toldNoCompose = true
+    toast($, 'CTM: plugins are kept out of the system prompt here (organization-managed Claude Code) – the CTM briefing comes with the blocks instead')
+  }
   return [BRIEFING_HEAD, INFO, '', ...lines].join('\n')
 }
 
@@ -1276,11 +1289,33 @@ async function runAsCommand($: EngineInterface, job: PendingReset & { mode: Mode
   awaitTimer = $.clock.after(timeout, () => {
     if (awaiting === job) void failReset($, job, `no confirmation that /${job.mode} ran within ${fmtDuration(timeout)}`)
   })
+  const before = job.mode === 'compact' ? await messageCount($) : null
   try {
     refusedBy(await $.command.run({ command: job.mode, args: job.mode === 'compact' ? (job.instructions ?? '') : '' }))
   } catch (err) {
     if (awaiting === job) await failReset($, job, errorText(err))
+    return
   }
+  if (before !== null && before > 0) $.clock.after(COMPACT_POLL_MS, () => void confirmByShrink($, job, before))
+}
+
+async function messageCount($: EngineInterface): Promise<number | null> {
+  const m = await safe(() => $.session.messages())
+  return Array.isArray(m) ? m.length : null
+}
+
+// The session.compact hook confirms a /compact run as a command. Where that event does not
+// reach CTM (an organization that manages Claude Code passes it over the plugins a person
+// installed), the confirmation is measured instead: the conversation the engine holds
+// shrinks once the compact ran.
+async function confirmByShrink($: EngineInterface, job: PendingReset, before: number): Promise<void> {
+  if (awaiting !== job) return
+  const now = await messageCount($)
+  if (now !== null && now < before) {
+    finishReset($, job, '[CTM] Your conversation was compacted as you scheduled.')
+    return
+  }
+  $.clock.after(COMPACT_POLL_MS, () => void confirmByShrink($, job, before))
 }
 
 async function runReset($: EngineInterface): Promise<void> {
@@ -1467,6 +1502,7 @@ async function ensureRunning($: EngineInterface): Promise<void> {
 
 const WAKEUPS = { plugin: 'ctm', key: 'wakeups' } as const
 const IDLE_UPDATES = { plugin: 'ctm', key: 'idleUpdates' } as const
+const BRIEFING = { plugin: 'ctm', key: 'briefing' } as const
 
 async function sessionId($: EngineInterface): Promise<string> {
   return (await safe(() => $.session.id())) ?? ''
@@ -1512,6 +1548,10 @@ async function restoreState($: EngineInterface): Promise<void> {
     lastWatchCheckAt = now
     lastTurnEndAt = Math.max(lastTurnEndAt, now)
   }
+  // A copy that came in mid-session may see no prompt.compose for a while (the engine
+  // need not render the system prompt anew): what an earlier copy saw still holds.
+  const keptBriefing = (await safe(() => $.state.get(BRIEFING)))?.value as Partial<KeptBriefing> | undefined
+  if (keptBriefing?.session === session && keptBriefing.composed === true) composed = true
 }
 
 // A subagent's settings call: only its own pause thresholds, which apply to it alone.
@@ -1569,6 +1609,7 @@ export const register: Register = (on, options) => {
   composed = false
   stepped = false
   briefed = false
+  toldNoCompose = false
   serverReading = null
   usageFetch = null
   lastUsageTryAt = Number.NEGATIVE_INFINITY
@@ -1902,7 +1943,11 @@ export const register: Register = (on, options) => {
 
   // Permanent briefing in the system prompt: there from the start, survives compact and clear.
   on('prompt.compose', async ($, e, next) => {
-    composed = true
+    if (!composed) {
+      composed = true
+      const kept: KeptBriefing = { session: await sessionId($), composed: true }
+      await safe(() => $.state.set(BRIEFING, kept))
+    }
     const r = await next(e)
     return { sections: [...r.sections, { id: 'ctm:info', text: INFO, scope: 'session' as const }] }
   }).catch(($, e, next) => next(e))

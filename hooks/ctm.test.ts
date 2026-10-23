@@ -318,6 +318,25 @@ describe('reset in a headless host', () => {
     expect(seen.prompts[0]).toContain(RESUME)
   })
 
+  test('where session.compact does not reach CTM, the shrunk conversation confirms the /compact', async ($, on) => {
+    const seen = world(on, USAGE, { headless: true })
+    const held = { count: 12 }
+    on('session.messages', () => ({ value: Array.from({ length: held.count }, () => ({ role: 'user', text: 'x', toolUses: [] })) }) as never)
+    const clock = mock.clock(on, { now: 1_000_000 })
+    on('turn.complete', () => ({ text: '' }) as never)
+    await $.tool.call({ tool: 'mcp__ctm__reset', mode: 'compact', instructions: INSTRUCTIONS, resumePrompt: RESUME } as never)
+    await $.turn.complete(turn)
+    await clock.advance(1_000)
+    expect(seen.commands).toEqual([`compact ${INSTRUCTIONS}`])
+    await clock.advance(10_000)
+    expect(seen.prompts).toEqual([]) // not compacted yet
+    held.count = 2 // the engine ran it; its session.compact event passed CTM by
+    await clock.advance(6_000)
+    expect(seen.prompts.length).toBe(1)
+    expect(seen.prompts[0]).toContain('[CTM] Your conversation was compacted as you scheduled.')
+    expect(seen.prompts[0]).toContain(RESUME)
+  })
+
   test('without confirmation it reports the failure', async ($, on) => {
     const seen = world(on)
     const clock = mock.clock(on, { now: 1_000_000 })
@@ -590,6 +609,29 @@ describe('where an organization keeps plugins out of the system prompt', () => {
     expect(await status($)).not.toContain('CTM briefing')
     await $.session.end({ reason: 'clear', sessionId: 's' } as never)
     expect(await status($)).toContain('CTM briefing')
+  })
+
+  test('the settings say where the briefing is', async ($, on) => {
+    world(on)
+    on('turn.step', answer as never)
+    mock.clock(on, { now: 10 * 60_000 })
+    const settings = async () => String((await $.tool.call({ tool: 'mcp__ctm__settings' } as never)).result)
+    expect(await settings()).toContain('- briefing: not known yet')
+    await step($)
+    expect(await settings()).toContain('- briefing: in the blocks – prompt.compose does not reach CTM here')
+  })
+
+  test('a fresh copy of the module trusts what an earlier one saw: prompt.compose did reach CTM', async ($, on) => {
+    world(on)
+    on('session.id', () => ({ value: 'sess-1' }) as never)
+    on('state.get', (_$, e, next) => {
+      if ((e as unknown as { key: string }).key !== 'briefing') return next(e)
+      return { value: { value: { session: 'sess-1', composed: true }, version: 1 } } as never
+    })
+    on('turn.step', answer as never)
+    mock.clock(on, { now: 10 * 60_000 })
+    await step($) // no prompt.compose reaches this copy (the engine need not render anew)
+    expect(await status($)).not.toContain('CTM briefing')
   })
 
   test('where prompt.compose reaches CTM, no block carries it', async ($, on) => {

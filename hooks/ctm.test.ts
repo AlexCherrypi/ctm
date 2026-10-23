@@ -40,9 +40,15 @@ const INIT_STDOUT = [
 ].join('\n')
 
 // The account's usage meter as a second `claude` answers the SDK's get_usage request;
-// `rateLimits` null: a login without rate limits.
+// `rateLimits` null: a login without rate limits; 'unreached': the fetch failed (429,
+// network) with nothing cached – rate_limits null on a login that has them.
 function usageStdout(rateLimits: unknown): string {
-  const response = { session: { total_cost_usd: 0 }, rate_limits_available: rateLimits !== null, rate_limits: rateLimits }
+  const unreached = rateLimits === 'unreached'
+  const response = {
+    session: { total_cost_usd: 0 },
+    rate_limits_available: unreached || rateLimits !== null,
+    rate_limits: unreached ? null : rateLimits,
+  }
   return [
     JSON.stringify({ type: 'system', subtype: 'ui_status', text: 'x' }),
     JSON.stringify({ type: 'control_response', response: { subtype: 'success', request_id: 'ctm', response } }),
@@ -75,6 +81,10 @@ function world(on: On, initial: Usage = USAGE, opts: WorldOpts = {}) {
     // What the usage meter answers (its rate_limits); undefined: the call fails.
     server: { current: undefined as unknown },
     usageFetches: [] as { argv: string[]; init: { stdin?: string; env?: Record<string, string> } }[],
+    // While on, the engine takes no prompt (its queue is closed).
+    refusePrompts: { on: false },
+    // While set, the engine drops each prompt with this reason (it resolves { drop }).
+    dropPrompts: { reason: null as string | null },
   }
   on('process.run', (_$, e) => {
     const { argv, init } = e as unknown as { argv: string[]; init?: { stdin?: string } }
@@ -146,6 +156,8 @@ function world(on: On, initial: Usage = USAGE, opts: WorldOpts = {}) {
     return { text: '' }
   })
   on('prompt.submit', (_$, e) => {
+    if (seen.refusePrompts.on) throw new Error('the prompt queue is closed')
+    if (seen.dropPrompts.reason) return { drop: seen.dropPrompts.reason } as never
     seen.prompts.push(e.text)
     return { text: e.text, context: e.context }
   })
@@ -1256,7 +1268,7 @@ describe('server readings', () => {
     expect(seen.prompts[0]).toContain('Go on.')
 
     const { argv, init } = seen.usageFetches[0]!
-    expect(argv).toEqual(expect.arrayContaining(['-p', '--no-session-persistence', '--strict-mcp-config', '--setting-sources', 'project']))
+    expect(argv).toEqual(expect.arrayContaining(['-p', '--no-session-persistence', '--strict-mcp-config', '--setting-sources', '']))
     expect(JSON.parse(init.stdin!).request).toEqual({ subtype: 'get_usage', skip_behaviors: true })
     expect(init.env).toEqual({ CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '' })
   })
@@ -1324,7 +1336,7 @@ describe('server readings', () => {
     expect(r).toContain('5-hour limit: 85% used') // the session's own, as the fallback
   })
 
-  test('the server reading is the default, taken again once 3 min old; the last response is the fallback', async ($, on) => {
+  test('the newest reading counts: each response\'s while the model works, the server\'s when none is newer', async ($, on) => {
     const seen = world(on) // the session's own reading: 23.5%
     on('turn.step', async function* (_$, e) {
       return { turnId: e.turnId, index: e.index, answer: 'ok', toolUses: [] } as never
@@ -1335,23 +1347,21 @@ describe('server readings', () => {
       for await (const _ of $.turn.step({ turnId: 't1', index: step++, model: 'claude-opus-5-5', messageCount: 1 } as never)) void _
     }
     seen.server.current = meter(30)
-    expect(await status($)).toContain('5-hour limit: 30% used')
+    expect(await status($)).toContain('5-hour limit: 30% used') // no response yet: the server's
     await clock.advance(60_000)
-    await respond() // 09:01: a model response brings the session's own
+    await respond() // 09:01: a model response brings the session's own, newer
     seen.server.current = meter(31)
     await clock.advance(60_000) // 09:02
-    expect(await status($)).toContain('5-hour limit: 30% used, Δ ±0') // still the server's; the next is not due yet
-    expect(seen.usageFetches.length).toBe(1)
-    await clock.advance(60_000) // 09:03
-    expect(await status($)).toContain('5-hour limit: 31% used, Δ +1 pt')
+    expect(await status($)).toContain('5-hour limit: 23.5% used, Δ -6.5 pts') // the response's
+    expect(seen.usageFetches.length).toBe(1) // a reading a minute old is not taken again
+    await clock.advance(3 * 60_000) // 09:05: the newest reading is 4 min old
+    expect(await status($)).toContain('5-hour limit: 31% used, Δ +7.5 pts')
     expect(seen.usageFetches.length).toBe(2)
 
     seen.server.current = undefined // the server cannot be read any more
-    await clock.advance(4 * 60_000) // 09:07
-    expect(await status($)).toMatch(/5-hour limit: 31% used[^\n]* · as of \d\d:\d\d\n/)
-    await clock.advance(60_000)
-    await respond() // 09:08
-    await clock.advance(6 * 60_000) // 09:14: the server reading is over 10 min old, the response newer
+    await clock.advance(4 * 60_000) // 09:09
+    expect(await status($)).toMatch(/5-hour limit: 31% used[^\n]* · as of 09:05\n/)
+    await respond() // 09:09: newer than the last server reading
     const r = await status($)
     expect(r).toContain('5-hour limit: 23.5% used')
     expect(r).not.toContain('as of')
@@ -1385,5 +1395,247 @@ describe('server readings', () => {
     const r2 = (await $.prompt.submit({ text: 'go on' } as never)).context?.join('\n') ?? ''
     expect(r2).toContain('Rate limits: account switched – no reading for the new account yet')
     expect(r2).not.toContain('5-hour limit')
+  })
+})
+
+describe('wake-ups that must not get lost', () => {
+  const NINE = Date.parse('2026-10-08T09:00:00.000Z')
+  const ELEVEN = Date.parse('2026-10-08T11:00:00.000Z')
+  const HIGH: Usage = {
+    context: { tokens: 84_000, window: 200_000, percent: 42 },
+    rateLimits: [
+      { kind: 'five_hour', percentUsed: 85, resetsAt: '2026-10-08T11:00:00.000Z' },
+      { kind: 'seven_day', percentUsed: 41.2, resetsAt: '2026-10-12T09:00:00.000Z' },
+    ],
+  }
+  const meter = (five: number) => ({
+    five_hour: { utilization: five, resets_at: '2026-10-08T11:00:00.000Z' },
+    seven_day: { utilization: 41.2, resets_at: '2026-10-12T09:00:00.000Z' },
+    limits: [{ kind: 'five_hour' }, { kind: 'seven_day' }],
+  })
+  const start = async ($: Engine, on: On) => {
+    on('session.start', () => ({ cwd: '/' }) as never)
+    await $.session.start({ cwd: '/' } as never)
+  }
+  const refresh = async ($: Engine) => String((await $.tool.call({ tool: 'mcp__ctm__status', refresh: true } as never)).result)
+
+  test('the checks start from any hook, session.start or not', async ($, on) => {
+    const seen = world(on, HIGH)
+    mock.store(on, { settings: { compactThreshold: 'off', pauseAt: { five_hour: 80 } } })
+    const clock = mock.clock(on, { now: NINE })
+    // No session.start: the timer is not running; arming the wake-up starts it.
+    const r = await $.tool.call({ tool: 'mcp__ctm__limit_wakeup', limit: 'five_hour', note: 'Go on.' } as never)
+    expect(String(r.result)).toContain('wake-up armed')
+    await clock.advance(121 * 60_000) // past 11:00
+    expect(seen.prompts).toHaveLength(1)
+    expect(seen.prompts[0]).toMatch(/Limit wake-up: the 5-hour limit is below 80% again \(its window reset at 11:00\)/)
+    expect(seen.prompts[0]).toContain('Go on.')
+  })
+
+  test('an armed wake-up is kept in $.state and comes back after a reload', async ($, on) => {
+    const seen = world(on, HIGH)
+    mock.store(on, { settings: { compactThreshold: 'off' } })
+    const clock = mock.clock(on, { now: NINE })
+    on('session.id', () => ({ value: 'sess-1' }) as never)
+    const writes: unknown[] = []
+    on('state.set', (_$, e, next) => {
+      if ((e as unknown as { key: string }).key === 'wakeups') writes.push((e as unknown as { value: unknown }).value)
+      return next(e)
+    })
+    await $.tool.call({ tool: 'mcp__ctm__limit_wakeup', limit: 'five_hour', belowPercent: 50, note: 'n' } as never)
+    expect(writes.at(-1)).toEqual({ session: 'sess-1', watches: [{ kind: 'five_hour', below: 50, note: 'n', resetsAt: ELEVEN }] })
+    await $.tool.call({ tool: 'mcp__ctm__limit_wakeup', limit: 'five_hour', cancel: true } as never)
+    expect(writes.at(-1)).toEqual({ session: 'sess-1', watches: [] })
+    expect(seen.prompts).toHaveLength(0)
+    void clock
+  })
+
+  test('a fresh copy of the module takes the wake-ups the previous one kept', async ($, on) => {
+    const seen = world(on, HIGH)
+    mock.store(on, { settings: { compactThreshold: 'off' } })
+    const clock = mock.clock(on, { now: NINE })
+    on('session.id', () => ({ value: 'sess-1' }) as never)
+    // What the module's previous copy kept for this session before the hooks worker was replaced.
+    on('state.get', (_$, e, next) => {
+      if ((e as unknown as { key: string }).key !== 'wakeups') return next(e)
+      const watches = [{ kind: 'five_hour', below: 80, note: 'Go on with step 4.', resetsAt: ELEVEN }]
+      return { value: { value: { session: 'sess-1', watches }, version: 1 } } as never
+    })
+    await start($, on) // the engine raises session.start again in the fresh copy
+    expect(await status($)).toContain('Wake-up armed: 5-hour limit below 80%')
+    await clock.advance(121 * 60_000)
+    expect(seen.prompts).toHaveLength(1)
+    expect(seen.prompts[0]).toMatch(/the 5-hour limit is below 80% again \(its window reset at 11:00\)/)
+    expect(seen.prompts[0]).toContain('Go on with step 4.')
+  })
+
+  test("a subagent's turn holds no wake-up back, a background one after the main turn included", async ($, on) => {
+    const seen = world(on, HIGH)
+    mock.store(on, { settings: { compactThreshold: 'off', pauseAt: { five_hour: 80 } } })
+    const clock = mock.clock(on, { now: NINE })
+    on('turn.start', (_$, e) => ({ turnId: e.turnId }) as never)
+    on('turn.complete', () => ({ text: '' }) as never)
+    await start($, on)
+    await $.turn.start({ text: 'go on', turnId: 't1' } as never)
+    await $.tool.call({ tool: 'mcp__ctm__limit_wakeup', limit: 'five_hour' } as never)
+    await $.turn.complete(turn)
+    await $.turn.start({ text: '', turnId: 't2', agentId: 'bg-1' } as never) // a background subagent goes on
+    await clock.advance(121 * 60_000)
+    expect(seen.prompts).toHaveLength(1)
+    expect(seen.prompts[0]).toMatch(/its window reset at 11:00/)
+  })
+
+  test('a wake-up the engine does not take is kept and sent again', async ($, on) => {
+    const seen = world(on, HIGH)
+    mock.store(on, { settings: { compactThreshold: 'off', pauseAt: { five_hour: 80 } } })
+    const clock = mock.clock(on, { now: NINE })
+    await start($, on)
+    await $.tool.call({ tool: 'mcp__ctm__limit_wakeup', limit: 'five_hour' } as never)
+    seen.refusePrompts.on = true
+    await clock.advance(121 * 60_000) // 11:01: the wake-up is due, the prompt refused
+    expect(seen.prompts).toHaveLength(0)
+    seen.refusePrompts.on = false
+    await clock.advance(3 * 60_000) // the next check sends it
+    expect(seen.prompts).toHaveLength(1)
+    expect(seen.prompts[0]).toMatch(/its window reset at 11:00/)
+  })
+
+  test('a fetch that failed with nothing cached is tried again after the usual back-off, not after an hour', async ($, on) => {
+    const seen = world(on, HIGH)
+    const clock = mock.clock(on, { now: NINE })
+    seen.server.current = 'unreached'
+    expect(await refresh($)).toContain(
+      'No fresh reading from the server: the server was not reached (or answered 429), and nothing was cached.',
+    )
+    await clock.advance(5 * 60_000 + 1_000)
+    seen.server.current = meter(40)
+    expect(await refresh($)).toContain('5-hour limit: 40% used')
+  })
+
+  test('a subagent waiting inside limit_wakeup goes by the server readings the ticker takes', async ($, on) => {
+    const seen = world(on, HIGH)
+    mock.store(on, { settings: { compactThreshold: 'off', pauseAt: { five_hour: 80 } } })
+    const clock = mock.clock(on, { now: NINE })
+    seen.server.current = meter(85)
+    let done = false
+    const call = $.tool.call({ tool: 'mcp__ctm__limit_wakeup', limit: 'five_hour', agentId: 'sub-1' } as never).then(
+      r => ((done = true), r),
+    )
+    await clock.advance(2 * 60_000)
+    expect(done).toBe(false)
+    seen.server.current = meter(40) // other work on the account is done: the server counts less now
+    await clock.advance(4 * 60_000)
+    const r = await call
+    expect(String(r.result)).toMatch(/the 5-hour limit is below 80% again \(it is at 40%\)\. Carry on/)
+  })
+
+  test('a newly passed pause mark comes with the next tool result, not only at the interval', async ($, on) => {
+    const seen = world(on, { ...HIGH, rateLimits: [{ ...HIGH.rateLimits[0]!, percentUsed: 70 }, HIGH.rateLimits[1]!] })
+    mock.store(on, { settings: { compactThreshold: 'off', pauseAt: { five_hour: 80 } } })
+    const clock = mock.clock(on, { now: NINE })
+    on('tool.call', { tool: 'Read' }, () => ({ result: 'content' }) as never)
+    const read = async () => (await $.tool.call({ tool: 'Read', file_path: '/a' } as never)).context?.join('\n')
+    expect(await read()).toContain('5-hour limit: 70% used')
+    await clock.advance(60_000)
+    expect(await read()).toBeUndefined() // within the interval and nothing new
+    seen.usage.current = HIGH // 85%: past the mark
+    expect(await read()).toMatch(/limit update[\s\S]*5-hour limit at 85% ≥ your pause threshold 80%: please pause/)
+    expect(await read()).toBeUndefined() // told once; the interval goes on as before
+  })
+
+  test('an unreadable ~/.claude.json is no account switch', async ($, on) => {
+    const seen = world(on)
+    const unreadable = { current: false }
+    on('env.get', (_$, e) => ({ value: (e as unknown as { name: string }).name === 'HOME' ? '/home/u' : undefined }) as never)
+    on('fs.read', (_$, e) => {
+      if (unreadable.current || (e as unknown as { path: string }).path !== '/home/u/.claude.json') throw new Error('EBUSY')
+      return { value: JSON.stringify({ oauthAccount: { accountUuid: 'acct-1' } }) } as never
+    })
+    const clock = mock.clock(on, { now: NINE })
+    await start($, on)
+    seen.server.current = meter(20)
+    const prompt = async () => (await $.prompt.submit({ text: 'go on' } as never)).context?.join('\n') ?? ''
+    expect(await prompt()).toContain('5-hour limit: 20% used')
+    unreadable.current = true
+    await clock.advance(60_000)
+    const r = await prompt()
+    expect(r).not.toContain('account switched')
+    expect(r).toContain('5-hour limit: 20% used, Δ ±0')
+    unreadable.current = false
+    await clock.advance(60_000)
+    expect(await prompt()).toContain('5-hour limit: 20% used, Δ ±0')
+  })
+
+  test("another session's kept wake-ups are not taken", async ($, on) => {
+    const seen = world(on, HIGH)
+    mock.store(on, { settings: { compactThreshold: 'off' } })
+    const clock = mock.clock(on, { now: NINE })
+    on('session.id', () => ({ value: 'sess-2' }) as never)
+    on('state.get', (_$, e, next) => {
+      if ((e as unknown as { key: string }).key !== 'wakeups') return next(e)
+      const watches = [{ kind: 'five_hour', below: 80, note: 'from sess-1', resetsAt: ELEVEN }]
+      return { value: { value: { session: 'sess-1', watches }, version: 1 } } as never
+    })
+    await start($, on)
+    expect(await status($)).not.toContain('Wake-up armed')
+    await clock.advance(121 * 60_000)
+    expect(seen.prompts).toHaveLength(0)
+  })
+
+  test("after /resume into another session, the ended one's wake-ups do not fire there", async ($, on) => {
+    const seen = world(on, HIGH)
+    mock.store(on, { settings: { compactThreshold: 'off', pauseAt: { five_hour: 80 } } })
+    const clock = mock.clock(on, { now: NINE })
+    const sid = { current: 'sess-a' }
+    on('session.id', () => ({ value: sid.current }) as never)
+    await start($, on)
+    await $.tool.call({ tool: 'mcp__ctm__limit_wakeup', limit: 'five_hour', note: 'Step 4 of conversation A.' } as never)
+    await $.session.end({ reason: 'resume', sessionId: 'sess-a' } as never)
+    sid.current = 'sess-b'
+    const r = (await $.prompt.submit({ text: 'hello B' } as never)).context?.join('\n') ?? ''
+    expect(r).not.toContain('wake-up armed')
+    await clock.advance(121 * 60_000)
+    expect(seen.prompts.some(p => p.includes('Step 4 of conversation A.'))).toBe(false)
+  })
+
+  test('a wake-up the engine drops (a stop holds back plugin prompts) is kept and sent once it takes them', async ($, on) => {
+    const seen = world(on, HIGH)
+    mock.store(on, { settings: { compactThreshold: 'off', pauseAt: { five_hour: 80 } } })
+    const clock = mock.clock(on, { now: NINE })
+    await start($, on)
+    await $.tool.call({ tool: 'mcp__ctm__limit_wakeup', limit: 'five_hour', note: 'Go on.' } as never)
+    seen.dropPrompts.reason = 'the session was stopped and nobody has sent input since'
+    await clock.advance(121 * 60_000) // 11:01: due, dropped
+    expect(seen.prompts).toHaveLength(0)
+    expect(await status($)).toContain('Wake-up armed: 5-hour limit below 80%') // still armed, not lost
+    seen.dropPrompts.reason = null
+    await clock.advance(3 * 60_000)
+    expect(seen.prompts).toHaveLength(1)
+    expect(seen.prompts[0]).toContain('Go on.')
+  })
+
+  test('a model request that brought no response is no reading', async ($, on) => {
+    const seen = world(on, { ...HIGH, rateLimits: [{ ...HIGH.rateLimits[0]!, percentUsed: 70 }, HIGH.rateLimits[1]!] })
+    on('turn.step', async function* (_$, e) {
+      return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: null, usage: null } as never
+    })
+    const clock = mock.clock(on, { now: NINE })
+    seen.server.current = meter(92)
+    expect(await status($)).toContain('5-hour limit: 92% used')
+    await clock.advance(60_000)
+    for await (const _ of $.turn.step({ turnId: 't1', index: 0, model: 'claude-opus-5-5', messageCount: 1 } as never)) void _
+    await clock.advance(60_000)
+    expect(await status($)).toContain('5-hour limit: 92% used') // not the 70% of an older response
+  })
+
+  test('on Windows a waiting subagent sleeps in ping, there being no sleep', async ($, on) => {
+    const seen = world(on, HIGH)
+    mock.store(on, { settings: { compactThreshold: 'off', pauseAt: { five_hour: 80 } } })
+    on('env.get', (_$, e) => ({ value: (e as unknown as { name: string }).name === 'OS' ? 'Windows_NT' : undefined }) as never)
+    const clock = mock.clock(on, { now: Date.parse('2026-10-08T10:58:00.000Z') })
+    const call = $.tool.call({ tool: 'mcp__ctm__limit_wakeup', limit: 'five_hour', agentId: 'sub-1' } as never)
+    await clock.advance(3 * 60_000) // past 11:00
+    expect(String((await call).result)).toMatch(/below 80% again \(its window reset at 11:00\)/)
+    expect(seen.spawns).toContainEqual(['ping', '-n', '4', '127.0.0.1'])
   })
 })

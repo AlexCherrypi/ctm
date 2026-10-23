@@ -1,4 +1,5 @@
 import type { EngineInterface, Register } from 'claude-code'
+import type { IdleWatch, KeptIdleUpdates, KeptWakeups, LimitKind, LimitWatch } from '../types'
 
 // CTM – Context and Token Manager
 //
@@ -22,10 +23,14 @@ import type { EngineInterface, Register } from 'claude-code'
 //    blocks ask the model to pause past them; `limit_wakeup` wakes it once the limit
 //    is back below).
 // 6. Reads the 5h/7d limits from the server – a second `claude`'s get_usage request,
-//    no model request, no tokens – at most every few minutes; the host's own reading
-//    (from the last model response) is the fallback.
+//    no model request, no tokens – while something waits on them and no response has
+//    brought a newer reading; the newest reading, the server's or the host's own (from
+//    the last model response), is the one that counts.
 //
-// Settings are kept across sessions in $.store. Everything else lives in module
+// Settings are kept across sessions in $.store. The armed wake-ups and idle updates are
+// kept in $.state as well: a reload of the mod, or a hooks worker the engine replaces,
+// starts the module over without its variables and timers (session.start runs again in
+// the fresh copy, and takes them back). Everything else lives in module
 // variables: it survives /clear (the module is not reloaded then) and is scoped to
 // this session; a reload of the mod starts it over.
 
@@ -39,23 +44,21 @@ type PendingReset = {
   instructions: string | null
   resumePrompt: string
 }
-type IdleWatch = { until: number | null }
 type LimitReading = { percent: number; resetsAt: string | null }
+// marks: the limits this block asked to pause for, so the next tool result tells of a
+// newly passed one at once instead of at the interval.
 type Snapshot = {
   at: number
   contextTokens: number | null
   limits: Record<string, LimitReading>
+  marks: string[]
 }
-type LimitKind = 'five_hour' | 'seven_day'
 // What the model or the person set; a missing key falls back to userConfig.
 type Settings = {
   intervalMinutes?: number
   compactThreshold?: string // "300k", "300000", "30%" or "off"
   pauseAt?: Partial<Record<LimitKind, number>> // percent; 0 = off
 }
-// resetsAt: the window's last known reset (ms) – the host can drop a limit from its
-// readings once that window has ended, and no new reading comes while the model pauses.
-type LimitWatch = { kind: LimitKind; below: number; note: string; resetsAt: number | null }
 // A rate limit as a block shows it: from the server, or the host's own. asOf: a server
 // reading old enough to say when it was taken.
 type RateLimit = { kind: string; percentUsed: number; resetsAt?: string; asOf?: number }
@@ -78,14 +81,19 @@ const NAG_EVERY_MS = 30 * 60_000
 // whatever is configured. Not a setting.
 const FALLBACK_PAUSE_AT: Record<LimitKind, number> = { five_hour: 95, seven_day: 97 }
 const MAX_INTERVAL_MINUTES = 60
-// A subagent waiting in limit_wakeup checks the limits again after each step.
-const WAIT_STEP_MS = 4_000
+// A subagent waiting in limit_wakeup checks the limits again after each step; short
+// enough that it stops soon after its signal aborts (a hook still running 5 s after
+// that counts toward a runaway, and two in a row get the hooks worker replaced).
+const WAIT_STEP_MS = 3_000
+// It stops waiting while this much of its hook's budget is left, rather than overrun it.
+const WAIT_BUDGET_MARGIN_MS = WAIT_STEP_MS + 2_000
 // In a subagent's prompt: its own pause thresholds, e.g. [CTM limits: 5h=70 7d=90].
 const LIMITS_MARK = /\[CTM limits:([^\]]*)\]/i
 
 const MIN_RESUME_CHARS = 20
 const MIN_INSTRUCTION_CHARS = 20
 const IDLE_TICK_MS = 30_000
+const TICK_DEAD_MS = 3 * IDLE_TICK_MS // no tick for this long: the ticker is gone, start it again
 const RESET_DELAY_MS = 1_000
 const COMPACT_CONFIRM_MS = 10 * 60_000
 const CLEAR_CONFIRM_MS = 2 * 60_000
@@ -93,10 +101,10 @@ const CHECK_TIMEOUT_MS = 30_000
 const CATALOG_TIMEOUT_MS = 20_000
 const CATALOG_TTL_MS = 15 * 60_000
 const USAGE_TIMEOUT_MS = 10_000
-const USAGE_GAP_MS = 3 * 60_000 // a server reading this old is taken again
+const USAGE_GAP_MS = 3 * 60_000 // a reading this old is taken again from the server
 const USAGE_DEMAND_GAP_MS = 30_000 // between two the model asks for (status refresh)
 const USAGE_MAX_AGE_MS = 10 * 60_000 // an answer older than this is the engine's cache
-const USAGE_SHOW_MS = 10 * 60_000 // a server reading beats a newer model response up to this age
+const USAGE_SNAPSHOT_MS = 60_000 // the engine answers get_usage from a snapshot up to this old, as fresh
 const USAGE_BACKOFF_MS = 5 * 60_000 // after a failed reading, doubling each time
 const USAGE_BACKOFF_MAX_MS = 60 * 60_000
 
@@ -116,12 +124,20 @@ let idle: IdleWatch | null = null
 let pending: PendingReset | null = null
 let awaiting: PendingReset | null = null // a reset run as a command, not yet confirmed by the engine
 let awaitTimer: { cancel: () => void } | null = null
-let idleTimer: { cancel: () => void } | null = null
+let ticker: { cancel: () => void } | null = null // wake-up checks, idle updates, server readings
+let lastTickAt = Number.NEGATIVE_INFINITY // the ticker's heartbeat
+let ticking = false
+let restored = false // the wake-ups and idle updates kept in $.state are taken back
 let settings: Settings | null = null // loaded from $.store on first use
 let lastNagAt = Number.NEGATIVE_INFINITY
 let lastWatchCheckAt = 0
 const watches = new Map<LimitKind, LimitWatch>()
 const agentPauseAt = new Map<string, Partial<Record<LimitKind, number>>>() // subagent -> its own pause thresholds
+let waitingAgents = 0 // subagents waiting inside limit_wakeup
+let lastDrop: string | null = null // why the engine last dropped one of CTM's own prompts
+let resave = false // after /clear: the session id changed, so the kept values are written anew
+// The process a waiting subagent sleeps in; null: none runs here; undefined: not probed yet.
+let sleeper: string[] | null | undefined
 let serverReading: ServerReading | null = null // the last good reading from the server
 let usageFetch: Promise<void> | null = null // a server reading in flight
 let lastUsageTryAt = Number.NEGATIVE_INFINITY
@@ -153,7 +169,7 @@ const INFO = [
   '```',
   '- The header gives the current local date and time and the time zone; every later time is in that zone (HH:MM on the same day, otherwise with weekday and date).',
   '- Δ is the change since the previous CTM block you received – the header names when that was – never a running total. "Δ window reset" means the limit window reset in between.',
-  '- The 5-hour and 7-day limits are account-wide: their Δ includes every parallel session of the account, not just yours. CTM reads them from the server (Claude Code\'s usage meter, no tokens) at most every 3 min – "as of HH:MM" marks an older reading; where the server cannot be read, they come from your last model response.',
+  '- The 5-hour and 7-day limits are account-wide: their Δ includes every parallel session of the account, not just yours. While you work they come with every model response; while something waits on them (a wake-up, idle updates, a subagent in the wake-up call), and for prompts and status requests once the newest reading is 3 min old, CTM reads them from the server (Claude Code\'s usage meter, no tokens). The newest reading counts; "as of HH:MM" marks an older server reading because a newer one failed.',
   '- When a limit climbs fast or is high, work more economically: fewer parallel subagents, read only what you need, compact earlier.',
   `- ${T_STATUS}: the current block on demand; refresh=true reads the limits anew from the server first (a few seconds, no tokens).`,
   `- ${T_IDLE}: blocks while you are idle as well (each one starts a new turn and costs quota; use sparingly, with maxMinutes).`,
@@ -275,23 +291,51 @@ function describeAgentLimits(own: Partial<Record<LimitKind, number>>): string {
     .join(', ')
 }
 
-// Waits until done() says so, in steps of WAIT_STEP_MS. A hook's time budget stops
-// while one of its $ calls is in flight but runs on through $.clock.sleep, so the step
-// is a `sleep` process; $.clock.sleep only where there is none. False when aborted.
-async function waitUntil($: EngineInterface, signal: AbortSignal, done: () => Promise<boolean>): Promise<boolean> {
-  while (!(await done())) {
-    if (signal.aborted) return false
+type WaitNext = { signal: AbortSignal; budget?: { remainingMs: number } }
+
+// One step of a subagent's wait in a process: `sleep`, on Windows `ping` (no `sleep` is
+// on its PATH by default). The first that works is kept; false where none does.
+async function sleepStep($: EngineInterface): Promise<boolean> {
+  const seconds = WAIT_STEP_MS / 1000
+  const tries =
+    sleeper !== undefined
+      ? sleeper ? [sleeper] : []
+      : [['sleep', String(seconds)], ...((await safe(() => $.env.get('OS'))) === 'Windows_NT' ? [['ping', '-n', String(seconds + 1), '127.0.0.1']] : [])]
+  for (const argv of tries) {
     const before = await $.clock.now()
-    const r = await safe(() => $.process.run(['sleep', String(WAIT_STEP_MS / 1000)], { timeoutMs: WAIT_STEP_MS + 10_000 }))
-    if (r?.exitCode !== 0 || (await $.clock.now()) - before < WAIT_STEP_MS / 2) {
-      try {
-        await $.clock.sleep(WAIT_STEP_MS, { signal })
-      } catch {
-        return false
-      }
+    const r = await safe(() => $.process.run(argv, { timeoutMs: WAIT_STEP_MS + 10_000 }))
+    if (r?.exitCode === 0 && (await $.clock.now()) - before >= WAIT_STEP_MS / 2) {
+      sleeper = argv
+      return true
     }
   }
-  return true
+  if (sleeper === undefined) sleeper = null
+  return false
+}
+
+// Waits until done() says so, in steps of WAIT_STEP_MS: 'met', 'aborted', or 'budget'
+// once the hook's own budget runs low – the wait ends rather than overrun it. A hook's
+// budget stops while one of its $ calls is in flight but runs on through $.clock.sleep,
+// so the step is a process; $.clock.sleep only where none runs (then the budget lasts a
+// few steps). done() must not wait for a server reading: the ticker takes them.
+async function waitUntil($: EngineInterface, next: WaitNext, done: () => Promise<boolean>): Promise<'met' | 'aborted' | 'budget'> {
+  waitingAgents += 1
+  try {
+    while (!(await done())) {
+      if (next.signal.aborted) return 'aborted'
+      if ((next.budget?.remainingMs ?? Number.POSITIVE_INFINITY) < WAIT_BUDGET_MARGIN_MS) return 'budget'
+      if (!(await sleepStep($))) {
+        try {
+          await $.clock.sleep(WAIT_STEP_MS, { signal: next.signal })
+        } catch {
+          return 'aborted'
+        }
+      }
+    }
+    return 'met'
+  } finally {
+    waitingAgents -= 1
+  }
 }
 
 // A reading whose window has reset since it was taken: rate limits come with the
@@ -552,10 +596,19 @@ function fmtAt(ms: number, ref: number): string {
 // the limits come from a second, short-lived `claude` asked for the account's usage
 // meter – the SDK's get_usage request, the fetch /usage does. It sends nothing to a
 // model and costs no tokens (about 3 s). The endpoint answers 429 when asked too often:
-// a reading is taken again once it is USAGE_GAP_MS old, and a failure backs off. The
-// host's own reading is the fallback.
+// a reading is taken only once the newest one at hand is USAGE_GAP_MS old, and a failure
+// backs off. Whichever is newer counts, the server's reading or the host's own.
+//
+// A hook never waits for a reading another hook or the ticker started: only the hook's
+// own $ calls stop its budget clock, so waiting on someone else's child process spends
+// the budget, and a hook still running 5 s past it counts toward a runaway – two in a row
+// and the engine replaces the hooks worker, whose fresh copy of the module has lost every
+// armed wake-up that lived only in its variables. So the
+// ticker (no budget) takes the readings anything waits on; a hook takes one itself only
+// for a block the person or the model asked for, and only when none is in flight.
 
-// The signed-in account, as ~/.claude.json names it; null where it cannot be read.
+// The signed-in account, as ~/.claude.json names it; null where it cannot be read
+// (no claude.ai login, missing, over $.fs.read's 4 MiB, not JSON).
 async function readAccount($: EngineInterface): Promise<string | null> {
   const dir = (await safe(() => $.env.get('CLAUDE_CONFIG_DIR'))) || (await safe(() => $.env.get('HOME')))
   if (!dir) return null
@@ -569,12 +622,14 @@ async function readAccount($: EngineInterface): Promise<string | null> {
 }
 
 // True when the account changed since the last look (a /login to another one): the
-// host's own reading and every delta then belong to the old account.
+// host's own reading and every delta then belong to the old account. A look that reads
+// no account keeps the one known: an unreadable file is no switch.
 async function checkAccount($: EngineInterface): Promise<boolean> {
   const now = await readAccount($)
+  if (now === null) return false
   const before = account
   account = now
-  if (before === undefined || before === now) return false
+  if (before === undefined || before === null || before === now) return false
   accountSwitchedAt = await $.clock.now()
   usageFailures = 0
   usageBackoffUntil = 0
@@ -604,8 +659,8 @@ async function fetchUsage($: EngineInterface): Promise<UsageAnswer> {
         '--verbose',
         '--no-session-persistence',
         '--strict-mcp-config',
-        '--setting-sources', // no user plugins or hooks: no second CTM in the child
-        'project',
+        '--setting-sources', // no settings: no plugins or hooks of the user's or the project's (no second CTM)
+        '',
       ],
       {
         stdin: `${JSON.stringify({ type: 'control_request', request_id: 'ctm', request: { subtype: 'get_usage', skip_behaviors: true } })}\n`,
@@ -629,7 +684,9 @@ async function fetchUsage($: EngineInterface): Promise<UsageAnswer> {
 // control_response.response.response.rate_limits.five_hour|seven_day = { utilization,
 // resets_at }. An answer from the engine's cache (its fetch failed, e.g. 429) has no
 // rate_limits.limits[], and seven_day_breakdown.as_of is the server time of the body:
-// both are checked, or old numbers would pass as fresh.
+// both are checked, or old numbers would pass as fresh. rate_limits_available false is
+// a login without rate limits; rate_limits null beside it true is a fetch that failed
+// with nothing cached (429, network) – worth another try after the usual back-off.
 function parseUsage(stdout: string, now: number): UsageAnswer {
   for (const line of stdout.split('\n')) {
     if (!line.includes('"control_response"')) continue
@@ -643,7 +700,8 @@ function parseUsage(stdout: string, now: number): UsageAnswer {
     const body = res?.response
     if (!body || typeof body !== 'object') continue
     const rl = body.rate_limits
-    if (body.rate_limits_available === false || !rl) return { error: 'this login has no rate limits to read', final: true }
+    if (body.rate_limits_available === false) return { error: 'this login has no rate limits to read', final: true }
+    if (!rl || typeof rl !== 'object') return { error: 'the server was not reached (or answered 429), and nothing was cached' }
     const asOf = parseTime(rl.seven_day_breakdown?.as_of)
     if (!Array.isArray(rl.limits) || (asOf !== null && now - asOf > USAGE_MAX_AGE_MS)) {
       return { error: 'only a cached answer – the server was not reached (or answered 429)' }
@@ -661,9 +719,11 @@ function parseUsage(stdout: string, now: number): UsageAnswer {
 }
 
 // Takes a server reading unless one was tried too recently or a failure holds it back;
-// `demand` (the model asked, or the account changed) waits less. Never throws.
-async function refreshLimits($: EngineInterface, demand = false): Promise<void> {
-  if (usageFetch) return usageFetch
+// `demand` (the model asked, or the account changed) waits less. A reading already in
+// flight is waited for only with `join` – by the ticker, which has no budget to spend.
+// Never throws.
+async function refreshLimits($: EngineInterface, { demand = false, join = false } = {}): Promise<void> {
+  if (usageFetch) return join ? usageFetch : undefined
   const now = await $.clock.now()
   if (now < usageBackoffUntil || now - lastUsageTryAt < (demand ? USAGE_DEMAND_GAP_MS : USAGE_GAP_MS)) return
   lastUsageTryAt = now
@@ -694,9 +754,10 @@ async function refreshLimits($: EngineInterface, demand = false): Promise<void> 
 
 // For the status tool's refresh: a line on why there is no fresh reading, '' when there is.
 async function refreshOnDemand($: EngineInterface): Promise<string> {
+  if (usageFetch) return 'No fresh reading yet: one is being taken from the server right now – ask again in a few seconds.'
   const tried = lastUsageTryAt
   const had = serverReading
-  await refreshLimits($, true)
+  await refreshLimits($, { demand: true })
   if (serverReading !== had) return ''
   const now = await $.clock.now()
   if (lastUsageTryAt !== tried) return `No fresh reading from the server: ${usageError ?? 'no answer'}.`
@@ -706,35 +767,57 @@ async function refreshOnDemand($: EngineInterface): Promise<string> {
   return `No fresh reading from the server: the last one was asked for ${fmtDuration(now - tried)} ago (at most every ${USAGE_DEMAND_GAP_MS / 1000} s).`
 }
 
-// The rate limits to go by: the server reading for this account – up to USAGE_SHOW_MS
-// old, and after that while no model response came since – else the host's own, which
-// also fill in what the server does not name. After a switch to another account the
-// host's own belong to the old one until the next response, so they are left out.
+// The rate limits to go by, per limit the newest reading: the server's for this account
+// when its numbers are newer than the last model response (they may come from a snapshot
+// up to USAGE_SNAPSHOT_MS old), else the host's own (which come with every response, so
+// while the model works they are the newest); either fills in what the other does not name. After a switch to another account the host's own belong to
+// the old one until the next response, so they are left out.
 function limitsNow(own: readonly RateLimit[], now: number): RateLimit[] {
   const out: RateLimit[] = accountSwitchedAt > lastResponseAt ? [] : [...own]
   const s = serverReading
-  if (!s || s.account !== (account ?? null) || (now - s.at > USAGE_SHOW_MS && s.at <= lastResponseAt)) return out
+  if (!s || s.account !== (account ?? null)) return out
+  const newer = s.at - USAGE_SNAPSHOT_MS > lastResponseAt
   const old = now - s.at >= USAGE_GAP_MS // a newer one failed or is held back
   for (const l of s.limits) {
-    const r: RateLimit = old ? { ...l, asOf: s.at } : { ...l }
     const i = out.findIndex(x => x.kind === l.kind)
+    if (i >= 0 && !newer) continue
+    const r: RateLimit = old ? { ...l, asOf: s.at } : { ...l }
     if (i >= 0) out[i] = r
     else out.push(r)
   }
   return out
 }
 
-// The rate limits now, with a new server reading first once the last one is due.
-async function currentLimits($: EngineInterface, own: readonly RateLimit[]): Promise<RateLimit[]> {
-  const s = serverReading
-  if (!s || s.account !== (account ?? null) || (await $.clock.now()) - s.at >= USAGE_GAP_MS) await refreshLimits($)
-  return limitsNow(own, await $.clock.now())
+// When the newest reading at hand was taken: the server's for this account, or the last
+// response's – unless that one belongs to the account before a switch.
+function newestReadingAt(): number {
+  const s = serverReading && serverReading.account === (account ?? null) ? serverReading.at : Number.NEGATIVE_INFINITY
+  return Math.max(s, accountSwitchedAt > lastResponseAt ? Number.NEGATIVE_INFINITY : lastResponseAt)
+}
+
+// Before a block the person or the model asked for (a prompt, status, arming a wake-up):
+// a server reading of the hook's own once the newest at hand is USAGE_GAP_MS old –
+// never one already in flight.
+async function refreshForBlock($: EngineInterface): Promise<void> {
+  if (usageFetch || (await $.clock.now()) - newestReadingAt() < USAGE_GAP_MS) return
+  await refreshLimits($)
+}
+
+// The ticker's server reading: for what waits on the limits – a wake-up check or an idle
+// update about to run, a subagent inside limit_wakeup – once the newest reading at hand
+// is USAGE_GAP_MS old. While the model works, every response brings the host's own anyway.
+async function refreshWhileWaited($: EngineInterface): Promise<void> {
+  const now = await $.clock.now()
+  if (waitingAgents === 0 && !watchDue(now) && !idleDue(now)) return
+  if (now - newestReadingAt() < USAGE_GAP_MS) return
+  await refreshLimits($, { join: true })
 }
 
 // ---------------------------------------------------------------- The report
 
 // `recipient` is whoever reads this block ('main' or a subagent's id); deltas are
-// measured against the previous report that same recipient got.
+// measured against the previous report that same recipient got. It takes no server
+// reading itself: the callers that may wait for one take it first.
 async function report($: EngineInterface, reason: string, recipient = 'main'): Promise<string> {
   await ensureTimeZone($)
   await ensureSettings($)
@@ -784,7 +867,8 @@ async function report($: EngineInterface, reason: string, recipient = 'main'): P
 
   // Rate limits
   const limits: Record<string, LimitReading> = {}
-  const rateLimits = await currentLimits($, u.rateLimits)
+  const marks: string[] = []
+  const rateLimits = limitsNow(u.rateLimits, now)
   if (rateLimits.length > 0) {
     for (const r of rateLimits) {
       const reading = { percent: r.percentUsed, resetsAt: r.resetsAt ?? null }
@@ -803,7 +887,10 @@ async function report($: EngineInterface, reason: string, recipient = 'main'): P
       lines.push(line)
     }
     const agent = recipient === 'main' ? undefined : recipient
-    for (const p of pastMarks(rateLimits, now, agent)) notes.push(pauseNote(p, now, agent))
+    for (const p of pastMarks(rateLimits, now, agent)) {
+      notes.push(pauseNote(p, now, agent))
+      marks.push(p.kind)
+    }
   } else if (accountSwitchedAt > lastResponseAt) {
     lines.push('Rate limits: account switched – no reading for the new account yet (it comes with the next response)')
   } else {
@@ -829,8 +916,16 @@ async function report($: EngineInterface, reason: string, recipient = 'main'): P
     )
   }
 
-  previousReport.set(recipient, { at: now, contextTokens: c.tokens ?? null, limits })
+  previousReport.set(recipient, { at: now, contextTokens: c.tokens ?? null, limits, marks })
   return lines.join('\n')
+}
+
+// A pause mark passed that the recipient's last block did not ask to pause for: the next
+// tool result carries a block at once, not only at the interval.
+async function newlyPastMark($: EngineInterface, recipient: string, now: number): Promise<boolean> {
+  const u = await $.session.usage()
+  const told = previousReport.get(recipient)?.marks ?? []
+  return pastMarks(limitsNow(u.rateLimits, now), now, recipient === 'main' ? undefined : recipient).some(p => !told.includes(p.kind))
 }
 
 // What a block says past a pause mark – a request, never a hard stop: the main agent
@@ -1182,21 +1277,44 @@ async function runReset($: EngineInterface): Promise<void> {
 
 // ---------------------------------------------------------------- Idle updates
 
+// Sends one of CTM's own prompts (a wake-up, an idle update); throws when it did not enter.
+// The engine answers { drop } rather than rejecting – a hook's or settings hook's block, a
+// host limit, or the hold after the person stopped the session (until they send input) –
+// and then no turn starts that would clear `busy`. The reason is told once per reason.
+async function submitOwn($: EngineInterface, what: string, text: string): Promise<void> {
+  const r = await $.prompt.submit({ text })
+  const drop = (r as { drop?: unknown } | undefined)?.drop
+  if (typeof drop === 'string') {
+    if (drop !== lastDrop) toast($, `CTM: ${what} held back – ${drop}; it is tried again at the next check`)
+    lastDrop = drop
+    throw new Error(drop)
+  }
+  lastDrop = null
+}
+
+// An idle update is due: on, not expired, the model idle, an interval since the last block.
+function idleDue(now: number): boolean {
+  if (!idle || busy || pending || awaiting || (idle.until !== null && now >= idle.until)) return false
+  return now - Math.max(lastSent.get('main') ?? 0, lastTurnEndAt) >= intervalMs()
+}
+
 async function idleTick($: EngineInterface): Promise<void> {
   if (!idle || busy || pending || awaiting) return
   const now = await $.clock.now()
   if (idle.until !== null && now >= idle.until) {
     idle = null
+    await saveIdle($)
     toast($, 'CTM: idle updates expired')
     return
   }
-  const since = Math.max(lastSent.get('main') ?? 0, lastTurnEndAt)
-  if (now - since < intervalMs()) return
-  await refreshLimits($)
-  if (!idle || busy || pending || awaiting) return // a turn started while CTM read the server
+  if (!idleDue(now)) return
   lastSent.set('main', now)
   busy = true // until turn.start / turn.complete take over
-  await $.prompt.submit({ text: await report($, 'idle update') })
+  try {
+    await submitOwn($, 'idle update', await report($, 'idle update'))
+  } catch {
+    busy = false // no turn was started: the next interval tries again
+  }
 }
 
 // ---------------------------------------------------------------- Limit wake-ups
@@ -1204,43 +1322,163 @@ async function idleTick($: EngineInterface): Promise<void> {
 // Is the limit back below the watch's mark? A reading from before its window's reset
 // counts as below: no new reading comes while the model pauses. So does no reading at
 // all once the reset the watch knows of has passed – the host drops a limit whose
-// window has ended.
+// window has ended – and a reading that names no reset time then.
 function watchMet(w: LimitWatch, r: { percentUsed: number; resetsAt?: string } | undefined, now: number): string | null {
-  if (!r) return w.resetsAt !== null && w.resetsAt <= now ? `its window reset ${fmtAt(w.resetsAt, now)}` : null
-  if (r.resetsAt) w.resetsAt = Date.parse(r.resetsAt)
-  if (readingIsStale(r, now)) return `its window reset ${fmtAt(Date.parse(r.resetsAt as string), now)}`
+  const knownReset = w.resetsAt !== null && w.resetsAt <= now ? `its window reset ${fmtAt(w.resetsAt, now)}` : null
+  if (!r) return knownReset
+  if (!r.resetsAt) return r.percentUsed < w.below ? `it is at ${fmtPercent(r.percentUsed)}` : knownReset
+  w.resetsAt = Date.parse(r.resetsAt)
+  if (readingIsStale(r, now)) return `its window reset ${fmtAt(w.resetsAt, now)}`
   if (r.percentUsed < w.below) return `it is at ${fmtPercent(r.percentUsed)}`
   return null
 }
 
-// Checks the armed wake-ups once per interval, and right when a known window reset has
-// passed – only while the model is idle: a wake-up starts a turn.
-async function watchTick($: EngineInterface): Promise<void> {
-  if (watches.size === 0 || busy || pending || awaiting) return
-  const now = await $.clock.now()
+// A wake-up check is due: a wake-up armed, the model idle, and an interval since the last
+// check or a known window reset passed since.
+function watchDue(now: number): boolean {
+  if (watches.size === 0 || busy || pending || awaiting) return false
   const resetPassed = [...watches.values()].some(w => w.resetsAt !== null && w.resetsAt > lastWatchCheckAt && w.resetsAt <= now)
-  if (!resetPassed && now - lastWatchCheckAt < intervalMs()) return
-  lastWatchCheckAt = now
+  return resetPassed || now - lastWatchCheckAt >= intervalMs()
+}
+
+// Checks the armed wake-ups once per interval, and right when a known window reset has
+// passed – only while the model is idle: a wake-up starts a turn. It goes by the readings
+// at hand; the ticker has taken a server reading first where one was due.
+async function watchTick($: EngineInterface): Promise<void> {
+  const now = await $.clock.now()
+  if (!watchDue(now)) return
   const u = await $.session.usage({ breakdown: 'summary' })
-  const limits = await currentLimits($, u.rateLimits)
-  if (busy || pending || awaiting) return // a turn started while CTM read the server
+  if (busy || pending || awaiting) return // a turn started meanwhile: the check stays due
+  lastWatchCheckAt = now
+  const limits = limitsNow(u.rateLimits, now)
+  const fired: LimitWatch[] = []
   const met: string[] = []
   const notes: string[] = []
+  let moved = false
   for (const w of [...watches.values()]) {
+    const before = w.resetsAt
     const why = watchMet(w, limits.find(r => r.kind === w.kind), now)
+    if (w.resetsAt !== before) moved = true
     if (!why) continue
     watches.delete(w.kind)
+    fired.push(w)
     met.push(`the ${limitName(w.kind)} is below ${fmtPercent(w.below)} again (${why})`)
     if (w.note) notes.push(w.note)
   }
-  if (met.length === 0) return
+  if (fired.length === 0) {
+    if (moved) await saveWatches($) // the reset time it learned survives a reload too
+    return
+  }
   lastSent.set('main', now)
   busy = true // until turn.start / turn.complete take over
-  toast($, `CTM: limit wake-up – ${met.join('; ')}`)
-  const parts = [`[CTM] Limit wake-up: ${met.join('; ')}. You can carry on with your work.`]
-  if (notes.length > 0) parts.push('', '--- Your note ---', ...notes)
-  parts.push('', await report($, 'limit wake-up'))
-  await $.prompt.submit({ text: parts.join('\n') })
+  await saveWatches($)
+  try {
+    const parts = [`[CTM] Limit wake-up: ${met.join('; ')}. You can carry on with your work.`]
+    if (notes.length > 0) parts.push('', '--- Your note ---', ...notes)
+    parts.push('', await report($, 'limit wake-up'))
+    await submitOwn($, 'limit wake-up', parts.join('\n'))
+    toast($, `CTM: limit wake-up – ${met.join('; ')}`)
+  } catch {
+    // No turn was started: keep the wake-ups, the next check sends them again.
+    for (const w of fired) if (!watches.has(w.kind)) watches.set(w.kind, w)
+    await saveWatches($)
+    busy = false
+  }
+}
+
+// ---------------------------------------------------------------- The ticker
+
+// Every IDLE_TICK_MS: the server reading something waits on, then the wake-up checks
+// and the idle updates – one after the other, so a wake-up marks the model busy before an
+// idle update could follow it. One tick at a time; the heartbeat goes on even while one
+// still runs.
+async function tick($: EngineInterface): Promise<void> {
+  lastTickAt = await $.clock.now()
+  if (ticking) return
+  ticking = true
+  try {
+    await refreshWhileWaited($)
+    await watchTick($)
+    await idleTick($)
+  } catch {
+    // the next tick tries again
+  } finally {
+    ticking = false
+  }
+}
+
+// The ticker runs from session.start, which the engine raises again in a fresh copy of
+// the module – a reload of the mod, or a hooks worker it replaced (a crash, a runaway
+// plugin): such a copy starts over, its variables and timers gone, so it takes the armed
+// wake-ups and idle updates back from $.state. Every other hook makes sure as well, in
+// case the timer was dropped. Never throws.
+async function ensureRunning($: EngineInterface): Promise<void> {
+  try {
+    if (!restored) {
+      restored = true
+      await restoreState($)
+    } else if (resave) {
+      resave = false // /clear gave the session a new id: keep them under it
+      await saveWatches($)
+      await saveIdle($)
+    }
+    const now = await $.clock.now()
+    if (ticker && now - lastTickAt < TICK_DEAD_MS) return
+    ticker?.cancel()
+    lastTickAt = now
+    ticker = $.clock.every(IDLE_TICK_MS, () => void tick($))
+  } catch {
+    // the next hook tries again
+  }
+}
+
+const WAKEUPS = { plugin: 'ctm', key: 'wakeups' } as const
+const IDLE_UPDATES = { plugin: 'ctm', key: 'idleUpdates' } as const
+
+async function sessionId($: EngineInterface): Promise<string> {
+  return (await safe(() => $.session.id())) ?? ''
+}
+
+async function saveWatches($: EngineInterface): Promise<void> {
+  const kept: KeptWakeups = { session: await sessionId($), watches: [...watches.values()].map(w => ({ ...w })) }
+  await safe(() => $.state.set(WAKEUPS, kept))
+}
+
+async function saveIdle($: EngineInterface): Promise<void> {
+  const kept: KeptIdleUpdates = { session: await sessionId($), idle: idle ? { ...idle } : null }
+  await safe(() => $.state.set(IDLE_UPDATES, kept))
+}
+
+// What the previous copy of the module kept for this session – only this session's;
+// what this copy already holds wins. Taken back, they start from now: the turn that may
+// be running went to the old copy, so the first check and idle update wait an interval.
+async function restoreState($: EngineInterface): Promise<void> {
+  const session = await sessionId($)
+  const kept = (await safe(() => $.state.get(WAKEUPS)))?.value as Partial<KeptWakeups> | undefined
+  let any = false
+  if (watches.size === 0 && kept?.session === session && Array.isArray(kept.watches)) {
+    for (const w of kept.watches as Partial<LimitWatch>[]) {
+      if (!w || !isLimitKind(w.kind) || typeof w.below !== 'number') continue
+      watches.set(w.kind, {
+        kind: w.kind,
+        below: w.below,
+        note: typeof w.note === 'string' ? w.note : '',
+        resetsAt: typeof w.resetsAt === 'number' ? w.resetsAt : null,
+      })
+      any = true
+    }
+  }
+  const keptIdle = (await safe(() => $.state.get(IDLE_UPDATES)))?.value as Partial<KeptIdleUpdates> | undefined
+  if (idle === null && keptIdle?.session === session && keptIdle.idle && typeof keptIdle.idle === 'object') {
+    const until = keptIdle.idle.until
+    idle = { until: typeof until === 'number' ? until : null }
+    any = true
+  }
+  if (any) {
+    const now = await $.clock.now()
+    lastWatchCheckAt = now
+    lastTurnEndAt = Math.max(lastTurnEndAt, now)
+  }
 }
 
 // A subagent's settings call: only its own pause thresholds, which apply to it alone.
@@ -1287,6 +1525,14 @@ export const register: Register = (on, options) => {
   lastWatchCheckAt = 0
   watches.clear()
   agentPauseAt.clear()
+  waitingAgents = 0
+  ticker = null
+  lastTickAt = Number.NEGATIVE_INFINITY
+  ticking = false
+  restored = false
+  resave = false
+  lastDrop = null
+  sleeper = undefined
   serverReading = null
   usageFetch = null
   lastUsageTryAt = Number.NEGATIVE_INFINITY
@@ -1309,8 +1555,8 @@ export const register: Register = (on, options) => {
       name: 'status',
       description:
         'CTM: Returns the current CTM block – context window fill and auto-compact threshold, the 5-hour and ' +
-        '7-day rate limits with reset times, and how each changed since your previous CTM block. The limits ' +
-        'are read from the server at most every 3 min; refresh=true reads them anew first.',
+        '7-day rate limits with reset times, and how each changed since your previous CTM block. Once the ' +
+        'newest reading of the limits is 3 min old they are read anew from the server first; refresh=true does so at once.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -1535,11 +1781,10 @@ export const register: Register = (on, options) => {
       }),
     )
     await ensureSettings($)
+    ticker?.cancel()
+    ticker = null
+    await ensureRunning($)
     await checkAccount($)
-
-    idleTimer?.cancel()
-    // One after the other: a wake-up marks the model busy, so no idle update follows it at once.
-    idleTimer = $.clock.every(IDLE_TICK_MS, () => void watchTick($).then(() => idleTick($)))
     return next(e)
   })
 
@@ -1565,16 +1810,34 @@ export const register: Register = (on, options) => {
       if (err) return { text: `CTM: ${err}` }
     } else await ensureSettings($)
     if (!key) return { text: describeSettings() }
+    await refreshForBlock($)
     const answer = await settingsAnswer($, true)
     lastSent.set('main', await $.clock.now())
     return { text: answer, context: [`The user changed the CTM settings with /ctm.\n${answer}`] }
   })
 
   on('session.end', async ($, e, next) => {
-    // /clear only ends the session formally; timer and state stay.
-    if (e.reason !== 'clear') {
-      idleTimer?.cancel()
-      idleTimer = null
+    if (e.reason === 'clear') {
+      // /clear only ends the session formally; timer and state stay, kept under the new id.
+      resave = true
+    } else {
+      // Another session takes its place in this process (/resume, a new login), or the
+      // process ends: nothing of the one that ended may fire into the next. The next hook
+      // takes that session's own wake-ups from $.state.
+      ticker?.cancel()
+      ticker = null
+      watches.clear()
+      idle = null
+      busy = false
+      pending = null
+      awaiting = null
+      awaitTimer?.cancel()
+      awaitTimer = null
+      agentPauseAt.clear()
+      lastSent.clear()
+      previousReport.clear()
+      lastWatchCheckAt = 0
+      restored = false
     }
     const r = await next(e)
     const job = awaiting
@@ -1608,13 +1871,17 @@ export const register: Register = (on, options) => {
 
   // ---------------------------------------------------------------- Turns
 
+  // Only the main loop's turns make it busy: a subagent's turn – a background one too,
+  // after the main turn has ended – holds no wake-up or idle update back.
   on('turn.start', async ($, e, next) => {
-    busy = true
+    if (!e.agentId) busy = true
+    await ensureRunning($)
     return next(e)
   })
 
   on('turn.complete', async ($, e, next) => {
     const r = await next(e)
+    await ensureRunning($)
     if (e.agentId) return r // a subagent's run does not end a turn of the main agent
     busy = false
     lastTurnEndAt = await $.clock.now()
@@ -1633,23 +1900,29 @@ export const register: Register = (on, options) => {
   // ---------------------------------------------------------------- The model's tools
 
   on('tool.call', { tool: T_STATUS }, async ($, e) => {
+    await ensureRunning($)
     const recipient = e.agentId ?? 'main'
-    const note = (e as unknown as { refresh?: unknown }).refresh === true ? await refreshOnDemand($) : ''
+    let note = ''
+    if ((e as unknown as { refresh?: unknown }).refresh === true) note = await refreshOnDemand($)
+    else await refreshForBlock($)
     lastSent.set(recipient, await $.clock.now())
     const block = await report($, 'status request', recipient)
     return { result: note ? `${block}\n${note}` : block }
   }).catch(() => ({ deny: 'CTM: could not read the current figures.' }))
 
   on('tool.call', { tool: T_IDLE }, async ($, e) => {
+    await ensureRunning($)
     const input = e as unknown as { enabled?: unknown; maxMinutes?: unknown }
     if (typeof input.enabled !== 'boolean') return { deny: 'CTM: "enabled" (true/false) is missing.' }
     if (!input.enabled) {
       idle = null
+      await saveIdle($)
       return { result: 'CTM: idle updates OFF.' }
     }
     const max = typeof input.maxMinutes === 'number' && input.maxMinutes > 0 ? input.maxMinutes : null
     const now = await $.clock.now()
     idle = { until: max === null ? null : now + max * MINUTE }
+    await saveIdle($)
     toast($, `CTM: idle updates on${max === null ? '' : ` for ${max} min`}`)
     return {
       result:
@@ -1693,6 +1966,7 @@ export const register: Register = (on, options) => {
     for (const k of ['intervalMinutes', 'compactThreshold', 'fiveHourPauseAt', 'sevenDayPauseAt'] as const) {
       if (k in input) change[k] = input[k]
     }
+    await refreshForBlock($)
     if (e.agentId) return { result: await changeAgentLimits($, e.agentId, change) }
     const changed = Object.keys(change).length > 0
     if (changed) {
@@ -1705,6 +1979,7 @@ export const register: Register = (on, options) => {
   }).catch(() => ({ deny: 'CTM: could not read or save the settings.' }))
 
   on('tool.call', { tool: T_WAKEUP }, async ($, e, next) => {
+    await ensureRunning($)
     const agent = e.agentId
     const input = e as unknown as { limit?: unknown; belowPercent?: unknown; note?: unknown; cancel?: unknown }
     const kind = input.limit
@@ -1712,6 +1987,7 @@ export const register: Register = (on, options) => {
     if (input.cancel === true) {
       if (agent) return { result: 'CTM: a subagent has no wake-up to remove – its wait ends with the call.' }
       const had = watches.delete(kind)
+      if (had) await saveWatches($)
       return { result: `CTM: ${had ? 'wake-up removed' : 'no wake-up was armed'} for the ${limitName(kind)}.` }
     }
     await ensureSettings($)
@@ -1722,9 +1998,10 @@ export const register: Register = (on, options) => {
           ? pauseAtFor(kind, agent)
           : FALLBACK_PAUSE_AT[kind]
     if (!(below > 0 && below <= 100)) return { deny: 'CTM: belowPercent must be from 1 to 100.' }
+    await refreshForBlock($)
     const now = await $.clock.now()
     const u = await $.session.usage({ breakdown: 'summary' })
-    const r = (await currentLimits($, u.rateLimits)).find(x => x.kind === kind)
+    const r = limitsNow(u.rateLimits, now).find(x => x.kind === kind)
     const watch: LimitWatch = {
       kind,
       below,
@@ -1737,12 +2014,31 @@ export const register: Register = (on, options) => {
     if (agent) {
       // A subagent's turn ending is its end: it waits here instead.
       let why: string | null = null
-      const done = await waitUntil($, next.signal, async () => {
+      const done = await waitUntil($, next, async () => {
         const u2 = await $.session.usage()
-        why = watchMet(watch, (await currentLimits($, u2.rateLimits)).find(x => x.kind === kind), await $.clock.now())
+        const at = await $.clock.now()
+        why = watchMet(watch, limitsNow(u2.rateLimits, at).find(x => x.kind === kind), at)
         return why !== null
       })
-      if (!done) return { result: 'CTM: the wait was interrupted.' }
+      if (done === 'aborted') return { result: 'CTM: the wait was interrupted.' }
+      if (done === 'budget' && sleeper === null) {
+        // No process to wait in: another call would end as soon, a model request each time.
+        return {
+          result:
+            `CTM: the ${limitName(kind)} is not below ${fmtPercent(below)} yet, and a subagent cannot wait inside ` +
+            `${T_WAKEUP} on this host (no sleep process runs here). Finish what must not be left half-done, then end ` +
+            'your work with a short report of where you stopped – the main agent can pause and be woken.' +
+            (watch.note ? `\n--- Your note ---\n${watch.note}` : ''),
+        }
+      }
+      if (done === 'budget') {
+        return {
+          result:
+            `CTM: the ${limitName(kind)} is not below ${fmtPercent(below)} yet, and this wait had to end (a hook's time ` +
+            `is bounded). Call ${T_WAKEUP} again (limit "${kind}") to wait on; do not start new work meanwhile.` +
+            (watch.note ? `\n--- Your note ---\n${watch.note}` : ''),
+        }
+      }
       return {
         result:
           `CTM: the ${limitName(kind)} is below ${fmtPercent(below)} again (${why}). Carry on with your work.` +
@@ -1750,6 +2046,7 @@ export const register: Register = (on, options) => {
       }
     }
     watches.set(kind, watch)
+    await saveWatches($)
     lastWatchCheckAt = now
     toast($, `CTM: wake-up armed – ${limitName(kind)} below ${fmtPercent(below)}`)
     return {
@@ -1858,11 +2155,15 @@ export const register: Register = (on, options) => {
     }
   }).catch(() => ({ deny: 'CTM: could not schedule the effort change.' }))
 
-  // The main loop's effort, as each of its model requests carries it.
+  // The main loop's effort, as each of its model requests carries it. A main step also
+  // means a main turn runs – a fresh copy of the module may not have heard its start.
   on('turn.step', async function* ($, e, next) {
-    if (!e.agentId && e.effort !== undefined) lastEffort = String(e.effort)
+    if (!e.agentId) {
+      busy = true
+      if (e.effort !== undefined) lastEffort = String(e.effort)
+    }
     const r = yield* next(e)
-    lastResponseAt = await $.clock.now() // the host's own limit reading is from now
+    if (r.stopReason !== null) lastResponseAt = await $.clock.now() // a response came: the host's own limit reading is from now
     return r
   })
 
@@ -1883,22 +2184,29 @@ export const register: Register = (on, options) => {
 
   // ---------------------------------------------------------------- Figures while working
 
+  // At most every interval – and at once when a pause mark is newly passed. It takes no
+  // server reading: while the model works, every response brings a fresh one.
   on('tool.call', async ($, e, next) => {
     const r = await next(e)
+    await ensureRunning($)
     if (r.deny !== undefined || String(e.tool).startsWith(PREFIX)) return r
     const recipient = e.agentId ?? 'main'
     const now = await $.clock.now()
-    if (now - (lastSent.get(recipient) ?? 0) < intervalMs()) return r
+    const due = now - (lastSent.get(recipient) ?? 0) >= intervalMs()
+    if (!due && !(await newlyPastMark($, recipient, now))) return r
     lastSent.set(recipient, now)
-    return { ...r, context: [...(r.context ?? []), await report($, 'work update', recipient)] }
+    return { ...r, context: [...(r.context ?? []), await report($, due ? 'work update' : 'limit update', recipient)] }
   }).catch(($, e, next) => next(e))
 
   // ---------------------------------------------------------------- The person's prompts
 
   on('prompt.submit', async ($, e, next) => {
+    await ensureRunning($)
     if (!attachToPrompts) return next(e)
     if (e.origin?.kind === 'plugin') return next(e) // our own wake-up and resume prompts carry the figures already
-    if (await checkAccount($)) await refreshLimits($, true) // a /login to another account
+    if (await checkAccount($)) {
+      if (!usageFetch) await refreshLimits($, { demand: true }) // a /login to another account
+    } else await refreshForBlock($)
     lastSent.set('main', await $.clock.now())
     return next({ ...e, context: [...(e.context ?? []), await report($, 'prompt')] })
   }).catch(($, e, next) => next(e))

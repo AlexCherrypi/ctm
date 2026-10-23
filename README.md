@@ -22,10 +22,11 @@ Context window: 327k of 1.00M tokens used (33%), Δ +12k · auto-compact at 967k
   left.
 - **5-hour / 7-day limit**: the account's rate limits in percent and their reset. Claude Code
   does not expose the size of a window or the plan, and CTM does not estimate it. The limits
-  are account-wide, so their Δ includes every parallel session. CTM reads them from the server
-  at most every 3 minutes (see [Readings from the server](#readings-from-the-server)); a line
-  ending in `as of HH:MM` is an older reading because a newer one failed. Where the server cannot
-  be read, they come from the model's last response.
+  are account-wide, so their Δ includes every parallel session. While the model works they come
+  with every model response; while something waits on them, and for your prompts and status
+  requests once the newest reading is 3 minutes old, CTM reads them from the server (see
+  [Readings from the server](#readings-from-the-server)). The newest reading counts; a line
+  ending in `as of HH:MM` is an older server reading because a newer one failed.
 - **Δ**: one per figure – context in tokens, each limit in points – always for that one window
   only, never a running total. `Δ window reset …` means the limit window reset inside it.
   Nothing is kept across sessions.
@@ -46,14 +47,15 @@ The model gets this legend once, in the CTM part of its system prompt (cached).
 |---|---|
 | Always (system prompt) | A short CTM briefing: what the `[CTM …]` blocks are, the tools, how to react to fast-climbing limits. Survives compact and clear. |
 | On every prompt you send | The current figures (turn off with `attachToPrompts`). |
-| While it works | At most every `intervalMinutes` (default 3, changeable by the model and by you) on a tool result, tracked per agent. |
+| While it works | At most every `intervalMinutes` (default 3, changeable by the model and by you) on a tool result, tracked per agent – and at once on the next tool result when a pause threshold is newly passed. |
 | While idle, if it turned that on | A wake-up prompt with the figures every `intervalMinutes` (each starts a turn). |
 | After a CTM compact/clear/model switch/effort change | What happened, the model and effort it now runs on, the CTM briefing, its resume prompt and the current figures. |
 
 ## Tools for the model
 
-- `mcp__ctm__status` `{ refresh? }` – the current figures on demand; `refresh: true` reads the
-  5-hour / 7-day limits anew from the server first (a few seconds, no tokens; at most every 30 s).
+- `mcp__ctm__status` `{ refresh? }` – the current figures on demand; once the newest reading of the
+  limits is 3 minutes old it reads them anew from the server first, and `refresh: true` does so at
+  once (a few seconds, no tokens; at most every 30 s).
 - `mcp__ctm__idle_updates` `{ enabled, maxMinutes? }` – idle updates on/off for this session.
 - `mcp__ctm__settings` `{ intervalMinutes?, compactThreshold?, fiveHourPauseAt?, sevenDayPauseAt? }` –
   shows (no arguments) or changes the settings; `null` puts one back to its default. From a
@@ -61,7 +63,7 @@ The model gets this legend once, in the CTM part of its system prompt (cached).
 - `mcp__ctm__limit_wakeup` `{ limit, belowPercent?, note?, cancel? }` – arms a wake-up for when the
   5-hour or 7-day limit is back below a mark (default: its pause threshold). From a subagent –
   whose turn ending would be its end – it waits right inside the call and returns once the limit
-  is back below.
+  is back below (or, should its hook's time run low, says so and asks to be called again).
 - `mcp__ctm__reset` `{ mode, instructions?, resumePrompt }` – schedules a compact or clear for
   the end of the current turn. Rules:
   - `resumePrompt` is required; `compact` also requires `instructions` for the summary. Both
@@ -149,11 +151,18 @@ settings, or arms or fires a limit wake-up.
 - **Limit wake-up**: while the model is idle, CTM checks every `intervalMinutes` whether the limit
   is back below the mark – because its window reset, or because it dropped – and then wakes the
   model with a message (plus its own note). The model can also arm one on its own, e.g. "wake me
-  when the 5-hour window has reset". Each check goes by the server reading (see below); where
-  that does not work, CTM falls back to the last reading the session has and treats a window
-  whose reset time has passed as reset – also when the limit drops out of the readings after its
-  reset. Right when a known reset time passes, CTM checks at once instead of waiting for the next
-  interval.
+  when the 5-hour window has reset". Each check goes by the newest reading: CTM reads the server
+  right before it (see below); where that does not work, it goes by the last reading the session
+  has and treats a window whose reset time has passed as reset – also when the limit drops out of
+  the readings after its reset. Right when a known reset time passes, CTM checks at once instead of
+  waiting for the next interval. A subagent's turn – a background one too – does not hold a
+  wake-up back, and a wake-up the engine does not take is kept and sent again at the next check.
+- **Wake-ups survive a reload**: an armed wake-up and idle updates are kept for the session in
+  `$.state`. A reload of the mod, or a hooks worker Claude Code replaces (after a crash, or when a
+  plugin's hooks overran their time), starts the module over without its variables and timers;
+  the fresh copy takes the armed wake-ups back when Claude Code raises `session.start` in it, and
+  every CTM hook makes sure the checks run. Another session in the same process (`/resume`) never
+  gets them.
 - **Subagents**: get the blocks like the main agent, with their own wording: they cannot end their
   turn and be woken (their turn ending is their end), so they wait inside `limit_wakeup`. To give a subagent **its own
   pause thresholds**, put e.g. `[CTM limits: 5h=70 7d=90]` into its prompt (one of the two is
@@ -223,28 +232,41 @@ CTM asks a second, short-lived `claude` for the account's usage meter – the SD
 control request, the same fetch `/usage` does (`GET /api/oauth/usage`). Nothing goes to a model
 and it costs no tokens; it takes about 3 s and briefly a second `claude` process.
 
-- **When**: before a block, once the last server reading is 3 minutes old (so a block waits up
-  to ~3 s at most every 3 minutes), before each limit wake-up check and idle update, on demand
-  with `mcp__ctm__status` `refresh: true` (at most every 30 s), and right after `/login` to
-  another account (with your next prompt; the account comes from `oauthAccount.accountUuid` in
-  `~/.claude.json`). Until there is a reading for the new account the block says so instead of
-  showing the old account's numbers, and it shows no Δ against them.
-- **Only real answers**: the child runs with `--setting-sources project` (no user plugins or
-  hooks, so no second CTM) and with `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` empty (set, the
-  fetch fails silently and the answer comes from a cache up to an hour old). An answer without
-  `rate_limits.limits[]`, or whose `seven_day_breakdown.as_of` is older than 10 minutes, is such
-  a cached one and is not used.
-- **Fallback**: the endpoint answers 429 when asked too often, so after a failure CTM waits 5
-  minutes, doubling up to an hour (an hour at once for a login without rate limits). Meanwhile a
-  server reading is shown – marked `as of HH:MM` – while it is at most 10 minutes old or no model
-  response came since; after that the session's own reading from the last response. Where no
-  second `claude` can run or has no claude.ai login of its own (e.g. a cloud session, whose login
-  the host manages), CTM keeps working with the session's own readings.
+- **When**: only when the newest reading at hand – the last server reading or the last model
+  response's – is 3 minutes old: right before a limit wake-up check or an idle update, every 3
+  minutes while a subagent waits inside `mcp__ctm__limit_wakeup`, before the block on your prompts,
+  on `mcp__ctm__status` and when a wake-up is armed (so such a block waits up to ~3 s), on demand
+  with `mcp__ctm__status` `refresh: true` (at most every 30 s), and right after `/login` to another
+  account (with your next prompt; the account comes from `oauthAccount.accountUuid` in
+  `~/.claude.json` – a file that cannot be read counts as no switch). Until there is a reading for
+  the new account the block says so instead of showing the old account's numbers, and it shows no
+  Δ against them. While the model works, every response brings a fresh reading, so the work
+  updates on tool results never wait for the server.
+- **Never at the cost of a hook's time**: a hook never waits for a reading another hook or the
+  timer has in flight. Claude Code bounds each hook's own time and counts waiting for someone
+  else's process against it; a hook that runs on past its time counts toward a runaway plugin,
+  and after two in a row Claude Code replaces the hooks worker.
+- **Only real answers**: the child runs with `--setting-sources ""` (no settings: no plugins or
+  hooks of yours or the project's, so no second CTM) and with
+  `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` empty (set, the fetch fails silently and the answer
+  comes from a cache up to an hour old). An answer without `rate_limits.limits[]`, or whose
+  `seven_day_breakdown.as_of` is older than 10 minutes, is such a cached one and is not used.
+- **Newest wins, with a fallback**: per limit, the server reading counts when its numbers are newer
+  than the last model response (Claude Code may answer from a snapshot up to a minute old), else the
+  session's own from that response. The endpoint answers 429
+  when asked too often, so after a failure CTM waits 5 minutes, doubling up to an hour (an hour at
+  once only for a login without rate limits; a fetch that failed with nothing cached is tried
+  again after the usual back-off). Meanwhile the last server reading is shown – marked
+  `as of HH:MM` – until a model response brings a newer one. Where no second `claude` can run or
+  has no claude.ai login of its own (e.g. a cloud session, whose login the host manages), CTM keeps
+  working with the session's own readings.
 
 ## Notes
 
-- Settings are kept across sessions. Everything else (idle updates, armed wake-ups, subagents' own
-  thresholds, cooldown, the previous report for Δ) is per session and survives `/clear`, not a reload of the mod.
+- Settings are kept across sessions. Armed wake-ups and idle updates are kept for the session
+  and survive `/clear`, a reload of the mod and a replaced hooks worker. Everything else
+  (subagents' own thresholds, cooldown, the previous report for Δ) is per session and survives
+  `/clear`, not a reload of the mod.
 - Idle updates cost quota: each one is a turn of its own.
 - Like a reset, a scheduled model switch runs after the turn has ended, so a one-shot `claude -p`
   exits before it happens; long-lived sessions (interactive, SDK, cloud) run it.

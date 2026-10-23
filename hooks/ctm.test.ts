@@ -1517,6 +1517,40 @@ describe('server readings', () => {
     expect(r2).not.toContain('5-hour limit')
   })
 
+  test('an older install keeps the account in ~/.claude/.config.json, which the engine goes by', async ($, on) => {
+    const seen = world(on)
+    const files: Record<string, string> = {
+      '/home/u/.claude/.config.json': JSON.stringify({ oauthAccount: { accountUuid: 'acct-1' } }),
+      '/home/u/.claude.json': JSON.stringify({ oauthAccount: { accountUuid: 'acct-9' } }), // not the engine's here
+    }
+    on('env.get', (_$, e) => ({ value: (e as unknown as { name: string }).name === 'HOME' ? '/home/u' : undefined }) as never)
+    on('fs.stat', (_$, e) => {
+      const text = files[(e as unknown as { path: string }).path]
+      if (text === undefined) throw new Error('ENOENT')
+      return { value: { kind: 'file', size: text.length, mtimeMs: 0, isLink: false } } as never
+    })
+    on('fs.read', (_$, e) => {
+      const text = files[(e as unknown as { path: string }).path]
+      if (text === undefined) throw new Error('ENOENT')
+      return { value: text } as never
+    })
+    const clock = mock.clock(on, { now: NINE })
+    await start($, on)
+    seen.server.current = meter(20)
+    const prompt = async () => (await $.prompt.submit({ text: 'go on' } as never)).context?.join('\n') ?? ''
+    expect(await prompt()).toContain('5-hour limit: 20% used')
+    expect(seen.usageFetches.length).toBe(1)
+    files['/home/u/.claude.json'] = JSON.stringify({ oauthAccount: { accountUuid: 'acct-8' } })
+    await clock.advance(60_000)
+    await prompt()
+    expect(seen.usageFetches.length).toBe(1) // no switch: that file is not the engine's
+    files['/home/u/.claude/.config.json'] = JSON.stringify({ oauthAccount: { accountUuid: 'acct-2' } })
+    seen.server.current = meter(5)
+    await clock.advance(60_000)
+    expect(await prompt()).toMatch(/5-hour limit: 5% used · resets/)
+    expect(seen.usageFetches.length).toBe(2)
+  })
+
   test('the response to a request sent before an account switch is still the old account\'s', async ($, on) => {
     const seen = world(on) // the session's own reading: 23.5%
     const who = { current: 'acct-1' }

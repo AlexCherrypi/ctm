@@ -165,6 +165,7 @@ let lastResponseAt = Number.NEGATIVE_INFINITY // the last model response: it bri
 let account: string | null | undefined // the signed-in account (oauthAccount.accountUuid); undefined = not read yet
 let accountSwitchedAt = Number.NEGATIVE_INFINITY
 let interactive = false // a person is at the prompt (session.start says)
+let configPath: string | null | undefined // the engine's global config; undefined = not looked for yet
 let stepsOut = new Map<object, number>() // the model requests out now, each with when it went out
 let oldStepBackAt = Number.NEGATIVE_INFINITY // when the last one sent before the account switch came back
 let switcher: { at: number; present: boolean } | null = null // whether the account switcher's tools are there
@@ -641,12 +642,35 @@ function fmtAt(ms: number, ref: number): string {
 // ticker (no budget) takes the readings anything waits on; a hook takes one itself only
 // for a block the person or the model asked for, and only when none is in flight.
 
-// ~/.claude.json, parsed; null where it cannot be read (missing, over $.fs.read's 4 MiB,
-// not JSON).
+// The engine's global config (~/.claude.json), found as the engine finds it: an older
+// install's <$CLAUDE_CONFIG_DIR or ~/.claude>/.config.json while that holds anything,
+// else $CLAUDE_CONFIG_DIR/.claude.json or the home folder's (os.homedir(): USERPROFILE
+// on Windows, also where a shell sets HOME) – .claude-custom-oauth.json with a custom
+// OAuth URL.
+async function configFile($: EngineInterface): Promise<string | null> {
+  if (configPath !== undefined) return configPath
+  const home = await safe(() => $.env.get('HOME'))
+  const profile = await safe(() => $.env.get('USERPROFILE'))
+  const isWindows = (await safe(() => $.env.get('OS'))) === 'Windows_NT'
+  const homeDir = (isWindows ? profile || home : home || profile)?.replace(/[\\/]+$/, '')
+  const configDir = (await safe(() => $.env.get('CLAUDE_CONFIG_DIR')))?.replace(/[\\/]+$/, '')
+  const suffix = (await safe(() => $.env.get('CLAUDE_CODE_CUSTOM_OAUTH_URL'))) ? '-custom-oauth' : ''
+  const dir = configDir || homeDir
+  const current = dir ? `${dir}/.claude${suffix}.json` : null
+  const legacyDir = configDir || (homeDir ? `${homeDir}/.claude` : null)
+  const legacy = legacyDir ? `${legacyDir}/.config.json` : null
+  const st = legacy ? await safe(() => $.fs.stat(legacy)) : undefined
+  const isLegacy = st?.kind === 'file' && (st.size > 0 || !current || !(await safe(() => $.fs.stat(current))))
+  configPath = isLegacy ? legacy : current
+  return configPath
+}
+
+// The engine's global config, parsed; null where it cannot be read (missing, over
+// $.fs.read's 4 MiB, not JSON).
 async function readConfig($: EngineInterface): Promise<Record<string, any> | null> {
-  const dir = (await safe(() => $.env.get('CLAUDE_CONFIG_DIR'))) || (await safe(() => $.env.get('HOME')))
-  if (!dir) return null
-  const text = await safe(() => $.fs.read(`${dir.replace(/\/+$/, '')}/.claude.json`))
+  const path = await configFile($)
+  if (!path) return null
+  const text = await safe(() => $.fs.read(path))
   try {
     const config = typeof text === 'string' ? JSON.parse(text) : null
     return config && typeof config === 'object' ? config : null
@@ -1680,6 +1704,7 @@ export const register: Register = (on, options) => {
   account = undefined
   accountSwitchedAt = Number.NEGATIVE_INFINITY
   interactive = false
+  configPath = undefined
   stepsOut = new Map()
   oldStepBackAt = Number.NEGATIVE_INFINITY
   switcher = null

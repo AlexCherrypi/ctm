@@ -255,10 +255,13 @@ and it costs no tokens; it takes about 3 s and briefly a second `claude` process
   on `mcp__ctm__status` and when a wake-up is armed (so such a block waits up to ~3 s), on demand
   with `mcp__ctm__status` `refresh: true` (at most every 30 s), and right after `/login` to another
   account (with your next prompt; the account comes from `oauthAccount.accountUuid` in
-  `~/.claude.json` – a file that cannot be read counts as no switch). Until there is a reading for
+  `~/.claude.json`, or wherever Claude Code keeps it: `$CLAUDE_CONFIG_DIR/.claude.json` where
+  that is set, an older install's `~/.claude/.config.json` – a file that cannot be read counts as
+  no switch). Until there is a reading for
   the new account the block says so instead of showing the old account's numbers, and it shows no
   Δ against them – also once the response to a request sent before the switch comes in, which
-  still went out under the old account. While the model works, every response brings a fresh
+  still went out under the old account (nor does any other response count while such a request is
+  out). While the model works, every response brings a fresh
   reading, so the work updates on tool results never wait for the server.
 - **Never at the cost of a hook's time**: a hook never waits for a reading another hook or the
   timer has in flight. Claude Code bounds each hook's own time and counts waiting for someone

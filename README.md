@@ -274,7 +274,8 @@ and it costs no tokens; it takes about 3 s and briefly a second `claude` process
   session with you at the prompt (terminal, VS Code) only once you approved it, and in `-p` and
   the SDK as it is. CTM tells which by the key's last 20 characters against
   `customApiKeyResponses.approved` in `~/.claude.json`, the way Claude Code does; the key itself
-  is read for nothing else and goes nowhere.
+  is read for nothing else and goes nowhere. With an `apiKeyHelper` in your settings the session
+  runs on its key, which the child (reading no settings) would not: then CTM does not ask.
 - **Newest wins, with a fallback**: per limit, the server reading counts when its numbers are newer
   than the last model response (Claude Code may answer from a snapshot up to a minute old), else the
   session's own from that response. The endpoint answers 429

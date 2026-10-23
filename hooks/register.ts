@@ -710,6 +710,11 @@ type UsageAnswer = { limits: ServerLimit[] } | { error: string; final?: boolean 
 
 async function fetchUsage($: EngineInterface): Promise<UsageAnswer> {
   const exe = (await safe(() => $.env.get('CLAUDE_CODE_EXECPATH'))) || 'claude'
+  // An apiKeyHelper in the settings: the session runs on its key, not on the claude.ai
+  // login, which the child – reading no settings – would read the limits of.
+  if (await safe(() => $.settings.read({ key: 'apiKeyHelper' }))) {
+    return { error: 'the session runs on an apiKeyHelper, which has no rate limits to read', final: true }
+  }
   // -p would take a key from the environment over the claude.ai login the session runs
   // on, and answer that there are no rate limits.
   const key = (await safe(() => $.env.get('ANTHROPIC_API_KEY')))?.trim()

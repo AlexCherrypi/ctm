@@ -1605,6 +1605,17 @@ describe('server readings', () => {
     expect(await prompt()).toContain('5-hour limit: 23.5% used')
   })
 
+  test('a session on an apiKeyHelper reads no limits from the server', async ($, on) => {
+    const seen = world(on)
+    on('settings.read', () => ({ value: { apiKeyHelper: '~/bin/anthropic-key.sh' } }) as never)
+    mock.clock(on, { now: NINE })
+    seen.server.current = meter(20) // the claude.ai login's, which the session does not run on
+    const r = await refresh($)
+    expect(r).toContain('No fresh reading from the server: the session runs on an apiKeyHelper, which has no rate limits to read.')
+    expect(r).not.toContain('20% used')
+    expect(seen.usageFetches).toHaveLength(0)
+  })
+
   test('the second claude leaves out an API key the session does not run on', async ($, on) => {
     const seen = world(on)
     const KEY = 'sk-ant-api03-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbbbbbb'

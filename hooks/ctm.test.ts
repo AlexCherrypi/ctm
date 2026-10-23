@@ -1642,11 +1642,13 @@ describe('server readings', () => {
   test('with nonessential traffic turned off the server is not asked', async ($, on) => {
     const seen = world(on)
     on('env.get', (_$, e) => ({ value: (e as unknown as { name: string }).name === 'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC' ? '1' : undefined }) as never)
-    mock.clock(on, { now: NINE })
+    const clock = mock.clock(on, { now: NINE })
     seen.server.current = meter(20)
     const r = await refresh($)
-    expect(r).toContain('No fresh reading from the server: CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC is set, and the usage meter is nonessential traffic.')
+    expect(r).toContain('No reading from the server in this session: CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC is set, and the usage meter is nonessential traffic.')
     expect(r).toContain('5-hour limit: 23.5% used') // the session's own
+    await clock.advance(60_000)
+    expect(await refresh($)).not.toContain('next try') // it does not change while the process runs
     expect(seen.usageFetches).toHaveLength(0)
   })
 
@@ -1656,9 +1658,19 @@ describe('server readings', () => {
     mock.clock(on, { now: NINE })
     seen.server.current = meter(20) // the claude.ai login's, which the session does not run on
     const r = await refresh($)
-    expect(r).toContain('No fresh reading from the server: the session runs on an apiKeyHelper, which has no rate limits to read.')
+    expect(r).toContain('No reading from the server in this session: the session runs on an apiKeyHelper, which has no rate limits to read.')
     expect(r).not.toContain('20% used')
     expect(seen.usageFetches).toHaveLength(0)
+  })
+
+  test('in the desktop app the host\'s login wins over an apiKeyHelper, so the server is read', async ($, on) => {
+    const seen = world(on)
+    on('settings.read', () => ({ value: { apiKeyHelper: '~/bin/anthropic-key.sh' } }) as never)
+    on('env.get', (_$, e) => ({ value: (e as unknown as { name: string }).name === 'CLAUDE_CODE_ENTRYPOINT' ? 'claude-desktop' : undefined }) as never)
+    mock.clock(on, { now: NINE })
+    seen.server.current = meter(20)
+    expect(await refresh($)).toContain('5-hour limit: 20% used')
+    expect(seen.usageFetches).toHaveLength(1)
   })
 
   test('the second claude leaves out an API key the session does not run on', async ($, on) => {
@@ -1691,12 +1703,18 @@ describe('server readings', () => {
     expect(await fetchEnv(false)).toEqual(kept) // -p and the SDK take the key as it is
     env.CLAUDE_CODE_ENTRYPOINT = 'claude-vscode'
     expect(await fetchEnv(false)).toEqual(dropped) // VS Code asks first, as the terminal does
-    unreadable.current = true
-    expect(await fetchEnv(true)).toEqual(kept) // what was approved cannot be read: as before
+    unreadable.current = true // what was approved cannot be read: nothing is guessed
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true } as never)
+    await clock.advance(31_000)
+    expect(await refresh($)).toContain(
+      'No fresh reading from the server: the global config cannot be read, so it is not known whether the session runs on ANTHROPIC_API_KEY.',
+    )
+    expect(seen.usageFetches).toHaveLength(4)
     unreadable.current = false
     env.ANTHROPIC_API_KEY = undefined
+    await clock.advance(5 * 60_000) // the usual back-off after a failed try
     expect(await fetchEnv(true)).toEqual(kept) // no key, nothing to leave out
-    expect(seen.usageFetches).toHaveLength(6)
+    expect(seen.usageFetches).toHaveLength(5)
   })
 })
 

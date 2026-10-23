@@ -161,6 +161,7 @@ let lastUsageTryAt = Number.NEGATIVE_INFINITY
 let usageFailures = 0
 let usageBackoffUntil = 0
 let usageError: string | null = null // why the last server reading failed
+let usageOff: string | null | undefined // why the server is not read in this session; undefined = not looked yet
 let lastResponseAt = Number.NEGATIVE_INFINITY // the last model response: it brings the host's own reading
 let account: string | null | undefined // the signed-in account (oauthAccount.accountUuid); undefined = not read yet
 let accountSwitchedAt = Number.NEGATIVE_INFINITY
@@ -689,11 +690,11 @@ async function readAccount($: EngineInterface): Promise<string | null> {
 // Whether the session itself runs on the API key in the environment, which the host
 // picks this way: -p and the SDK take it as it is (not under VS Code), a session with a
 // person at the prompt only once they let it – ~/.claude.json keeps the last 20
-// characters of each key they did. Where that cannot be read, as if it did.
-async function sessionUsesKey($: EngineInterface, key: string): Promise<boolean> {
+// characters of each key they did. undefined where that cannot be read.
+async function sessionUsesKey($: EngineInterface, key: string): Promise<boolean | undefined> {
   if (!interactive && (await safe(() => $.env.get('CLAUDE_CODE_ENTRYPOINT'))) !== 'claude-vscode') return true
   const config = await readConfig($)
-  if (!config) return true
+  if (!config) return undefined
   const approved = config.customApiKeyResponses?.approved
   return Array.isArray(approved) && approved.includes(key.trim().slice(-20))
 }
@@ -730,25 +731,42 @@ function parseTime(v: unknown): number | null {
   return Number.isFinite(ms) ? ms : null
 }
 
+// Why the server is not read in this session at all, or null: nothing here changes while
+// the process runs.
+// - The usage meter is traffic Claude Code counts as nonessential. Where the person turned
+//   that off, the child would read it only with the setting undone, and send everything
+//   else nonessential with it.
+// - An apiKeyHelper in the settings: the session runs on its key, not on the claude.ai
+//   login, which the child – reading no settings – would read the limits of. The engine
+//   counts the helper everywhere but in the desktop app, a local agent and a remote
+//   session, where the host's login wins – unless the host hands in auth of its own (the
+//   3p desktop app, CLAUDE_CODE_HOST_AUTH_ENV_VAR) without managing the provider.
+async function serverOff($: EngineInterface): Promise<string | null> {
+  if (await safe(() => $.env.get('CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC'))) {
+    return 'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC is set, and the usage meter is nonessential traffic'
+  }
+  if (!(await safe(() => $.settings.read({ key: 'apiKeyHelper' })))) return null
+  const entrypoint = (await safe(() => $.env.get('CLAUDE_CODE_ENTRYPOINT'))) ?? ''
+  const hosted = !!(await safe(() => $.env.get('CLAUDE_CODE_REMOTE'))) || ['claude-desktop', 'claude-desktop-3p', 'local-agent'].includes(entrypoint)
+  const helperCounts =
+    !hosted ||
+    ((!!(await safe(() => $.env.get('CLAUDE_CODE_HOST_AUTH_ENV_VAR'))) || entrypoint === 'claude-desktop-3p') &&
+      !(await safe(() => $.env.get('CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST'))))
+  return helperCounts ? 'the session runs on an apiKeyHelper, which has no rate limits to read' : null
+}
+
 type UsageAnswer = { limits: ServerLimit[] } | { error: string; final?: boolean }
 
 async function fetchUsage($: EngineInterface): Promise<UsageAnswer> {
   const exe = (await safe(() => $.env.get('CLAUDE_CODE_EXECPATH'))) || 'claude'
-  // The usage meter is traffic Claude Code counts as nonessential: where the person turned
-  // that off, it is not read (the child would read it only with the setting undone, and
-  // send everything else nonessential with it).
-  if (await safe(() => $.env.get('CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC'))) {
-    return { error: 'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC is set, and the usage meter is nonessential traffic', final: true }
-  }
-  // An apiKeyHelper in the settings: the session runs on its key, not on the claude.ai
-  // login, which the child – reading no settings – would read the limits of.
-  if (await safe(() => $.settings.read({ key: 'apiKeyHelper' }))) {
-    return { error: 'the session runs on an apiKeyHelper, which has no rate limits to read', final: true }
-  }
   // -p would take a key from the environment over the claude.ai login the session runs
   // on, and answer that there are no rate limits.
   const key = (await safe(() => $.env.get('ANTHROPIC_API_KEY')))?.trim()
-  const dropKey = !!key && !(await sessionUsesKey($, key))
+  const usesKey = key ? await sessionUsesKey($, key) : true
+  if (usesKey === undefined) {
+    return { error: 'the global config cannot be read, so it is not known whether the session runs on ANTHROPIC_API_KEY' }
+  }
+  const dropKey = !usesKey
   try {
     const r = await $.process.run(
       [
@@ -825,6 +843,8 @@ function parseUsage(stdout: string, now: number): UsageAnswer {
 // Never throws.
 async function refreshLimits($: EngineInterface, { demand = false, join = false } = {}): Promise<void> {
   if (usageFetch) return join ? usageFetch : undefined
+  if (usageOff === undefined) usageOff = await serverOff($)
+  if (usageOff) return
   const now = await $.clock.now()
   if (now < usageBackoffUntil || now - lastUsageTryAt < (demand ? USAGE_DEMAND_GAP_MS : USAGE_GAP_MS)) return
   lastUsageTryAt = now
@@ -859,6 +879,7 @@ async function refreshOnDemand($: EngineInterface): Promise<string> {
   const tried = lastUsageTryAt
   const had = serverReading
   await refreshLimits($, { demand: true })
+  if (usageOff) return `No reading from the server in this session: ${usageOff}.`
   if (serverReading !== had) return ''
   const now = await $.clock.now()
   if (lastUsageTryAt !== tried) return `No fresh reading from the server: ${usageError ?? 'no answer'}.`
@@ -995,7 +1016,10 @@ async function report($: EngineInterface, reason: string, recipient = 'main', { 
       marks.push(p.kind)
     }
   } else if (accountSwitchedAt > lastResponseAt) {
-    lines.push('Rate limits: account switched – no reading for the new account yet (it comes with the next response)')
+    lines.push(
+      'Rate limits: account switched – no reading for the new account yet (it comes with the server reading or the ' +
+        'first response to a request sent after the switch, once none from before it is out)',
+    )
   } else {
     lines.push('Rate limits: not reported (not signed in with a subscription, or no response yet)')
   }
@@ -1705,6 +1729,7 @@ export const register: Register = (on, options) => {
   usageFailures = 0
   usageBackoffUntil = 0
   usageError = null
+  usageOff = undefined
   lastResponseAt = Number.NEGATIVE_INFINITY
   account = undefined
   accountSwitchedAt = Number.NEGATIVE_INFINITY
@@ -2351,8 +2376,10 @@ export const register: Register = (on, options) => {
       if (r.stopReason !== null && isNewAccount(sentAt)) lastResponseAt = await $.clock.now()
       return r
     } finally {
+      // Gone from stepsOut only once oldStepBackAt holds it, with no wait in between.
+      const back = await safe(() => $.clock.now())
       stepsOut.delete(step)
-      if (sentAt < accountSwitchedAt) oldStepBackAt = await $.clock.now()
+      if (sentAt < accountSwitchedAt) oldStepBackAt = Math.max(oldStepBackAt, back ?? sentAt)
     }
   })
 

@@ -256,13 +256,14 @@ and it costs no tokens; it takes about 3 s and briefly a second `claude` process
   with `mcp__ctm__status` `refresh: true` (at most every 30 s), and right after `/login` to another
   account (with your next prompt; the account comes from `oauthAccount.accountUuid` in
   `~/.claude.json`, or wherever Claude Code keeps it: `$CLAUDE_CONFIG_DIR/.claude.json` where
-  that is set, an older install's `~/.claude/.config.json` – a file that cannot be read counts as
-  no switch). Until there is a reading for
-  the new account the block says so instead of showing the old account's numbers, and it shows no
-  Δ against them – also once the response to a request sent before the switch comes in, which
-  still went out under the old account (nor does any other response count while such a request is
-  out). While the model works, every response brings a fresh
-  reading, so the work updates on tool results never wait for the server.
+  that is set, an older install's `.config.json` in `$CLAUDE_CONFIG_DIR` or `~/.claude`,
+  `.claude-custom-oauth.json` with `CLAUDE_CODE_CUSTOM_OAUTH_URL` – a file that cannot be read
+  counts as no switch). Until there is a reading for the new account the block says so instead of
+  showing the old account's numbers, and it shows no Δ against them. A response counts for the new
+  account only when its request went out after the switch and after every request from before
+  it had come back: those went out under the old account, and their headers bring its numbers.
+  While the model works, every response brings a fresh reading, so the work updates on tool
+  results never wait for the server.
 - **Never at the cost of a hook's time**: a hook never waits for a reading another hook or the
   timer has in flight. Claude Code bounds each hook's own time and counts waiting for someone
   else's process against it; a hook that runs on past its time counts toward a runaway plugin,
@@ -272,15 +273,18 @@ and it costs no tokens; it takes about 3 s and briefly a second `claude` process
   or whose `seven_day_breakdown.as_of` is older than 10 minutes, comes from Claude Code's cache
   and is not used.
 - **Your opt-out holds**: Claude Code counts the usage meter as nonessential traffic. With
-  `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` set, CTM does not ask the server and goes by the
-  session's own readings.
-  `-p` takes an `ANTHROPIC_API_KEY` from the environment over the claude.ai login, so where the
-  session itself does not run on that key the child gets it empty. Claude Code takes the key in a
-  session with you at the prompt (terminal, VS Code) only once you approved it, and in `-p` and
-  the SDK as it is. CTM tells which by the key's last 20 characters against
-  `customApiKeyResponses.approved` in `~/.claude.json`, the way Claude Code does; the key itself
-  is read for nothing else and goes nowhere. With an `apiKeyHelper` in your settings the session
-  runs on its key, which the child (reading no settings) would not: then CTM does not ask.
+  `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` set, CTM does not ask the server in that session and
+  goes by the session's own readings; `refresh: true` says so.
+- **The session's own login**: `-p` takes an `ANTHROPIC_API_KEY` from the environment over the
+  claude.ai login, so where the session itself does not run on that key the child gets it empty.
+  Claude Code takes the key in a session with you at the prompt (terminal, VS Code) only once you
+  approved it, and in `-p` and the SDK as it is. CTM tells which by the key's last 20 characters
+  against `customApiKeyResponses.approved` in `~/.claude.json`, the way Claude Code does; the key
+  itself is read for nothing else and goes nowhere. Where that file cannot be read, CTM does not
+  guess and tries again after the usual back-off. With an `apiKeyHelper` in your settings the
+  session runs on its key, which the child (reading no settings) would not: then CTM does not ask
+  – except in the desktop app, a local agent and a remote session, where Claude Code's own login
+  wins over the helper.
 - **Newest wins, with a fallback**: per limit, the server reading counts when its numbers are newer
   than the last model response (Claude Code may answer from a snapshot up to a minute old), else the
   session's own from that response. The endpoint answers 429

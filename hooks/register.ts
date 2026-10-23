@@ -165,6 +165,8 @@ let lastResponseAt = Number.NEGATIVE_INFINITY // the last model response: it bri
 let account: string | null | undefined // the signed-in account (oauthAccount.accountUuid); undefined = not read yet
 let accountSwitchedAt = Number.NEGATIVE_INFINITY
 let interactive = false // a person is at the prompt (session.start says)
+let stepsOut = new Map<object, number>() // the model requests out now, each with when it went out
+let oldStepBackAt = Number.NEGATIVE_INFINITY // when the last one sent before the account switch came back
 let switcher: { at: number; present: boolean } | null = null // whether the account switcher's tools are there
 
 // From userConfig, set in register
@@ -685,6 +687,16 @@ async function checkAccount($: EngineInterface): Promise<boolean> {
   usageFailures = 0
   usageBackoffUntil = 0
   for (const [k, p] of previousReport) previousReport.set(k, { ...p, limits: {} })
+  return true
+}
+
+// Whether the host's own reading is the account's since the last switch once the response
+// to a request sent at `sentAt` came: the request went out after the switch, and none
+// sent before it came back since or is still out – its headers, under the old account,
+// would put that one's numbers back.
+function isNewAccount(sentAt: number): boolean {
+  if (sentAt < accountSwitchedAt || sentAt < oldStepBackAt) return false
+  for (const s of stepsOut.values()) if (s < accountSwitchedAt) return false
   return true
 }
 
@@ -1663,6 +1675,8 @@ export const register: Register = (on, options) => {
   account = undefined
   accountSwitchedAt = Number.NEGATIVE_INFINITY
   interactive = false
+  stepsOut = new Map()
+  oldStepBackAt = Number.NEGATIVE_INFINITY
   switcher = null
   cooldownMs = Math.max(0, Number(options.resetCooldownMinutes ?? 10)) * MINUTE
   effortCooldownMs = Math.max(0, Number(options.effortCooldownMinutes ?? 10)) * MINUTE
@@ -2292,12 +2306,19 @@ export const register: Register = (on, options) => {
       if (e.effort !== undefined) lastEffort = String(e.effort)
     }
     const sentAt = await $.clock.now()
-    const r = yield* next(e)
-    if (!e.agentId) stepped = true
-    // A response came: the host's own limit reading is from now – unless the request
-    // went out before an account switch, under the old account.
-    if (r.stopReason !== null && sentAt >= accountSwitchedAt) lastResponseAt = await $.clock.now()
-    return r
+    const step = {}
+    stepsOut.set(step, sentAt)
+    try {
+      const r = yield* next(e)
+      if (!e.agentId) stepped = true
+      // A response came: the host's own limit reading is from now – unless it may still
+      // be the account's before a switch.
+      if (r.stopReason !== null && isNewAccount(sentAt)) lastResponseAt = await $.clock.now()
+      return r
+    } finally {
+      stepsOut.delete(step)
+      if (sentAt < accountSwitchedAt) oldStepBackAt = await $.clock.now()
+    }
   })
 
   // ---------------------------------------------------------------- Subagents

@@ -1552,6 +1552,59 @@ describe('server readings', () => {
     expect(await prompt()).toContain('5-hour limit: 23.5% used')
   })
 
+  test('while a request from before the switch is out, no response counts for the new account', async ($, on) => {
+    world(on) // the session's own reading: 23.5%
+    const who = { current: 'acct-1' }
+    on('env.get', (_$, e) => ({ value: (e as unknown as { name: string }).name === 'HOME' ? '/home/u' : undefined }) as never)
+    on('fs.read', () => ({ value: JSON.stringify({ oauthAccount: { accountUuid: who.current } }) }) as never)
+    const holds = new Map<number, () => void>()
+    on('turn.step', async function* (_$, e) {
+      await new Promise<void>(r => holds.set(e.index, r))
+      return { turnId: e.turnId, index: e.index, answer: 'ok', toolUses: [], stopReason: 'end_turn', usage: null } as never
+    })
+    const clock = mock.clock(on, { now: NINE })
+    await start($, on)
+    const prompt = async () => (await $.prompt.submit({ text: 'go on' } as never)).context?.join('\n') ?? ''
+    const send = (index: number, agentId?: string) =>
+      (async () => {
+        for await (const _ of $.turn.step({ turnId: 't1', index, agentId, model: 'claude-opus-5-5', messageCount: 1 } as never)) void _
+      })()
+    const land = async (index: number, sent: Promise<void>) => {
+      holds.get(index)!()
+      await sent
+      await clock.advance(1_000)
+    }
+    const SWITCHED = 'Rate limits: account switched – no reading for the new account yet'
+
+    const a = send(0, 'sub-1') // a subagent's request under acct-1
+    await clock.advance(1_000)
+    who.current = 'acct-2'
+    expect(await prompt()).toContain(SWITCHED)
+    await clock.advance(1_000)
+    const b = send(1) // under acct-2 – while sub-1's is still out
+    await clock.advance(1_000)
+    await land(1, b)
+    expect(await prompt()).toContain(SWITCHED) // sub-1's headers may still come and overwrite these
+    await land(0, a)
+    expect(await prompt()).toContain(SWITCHED)
+
+    // The old one comes back while the new one is out.
+    const c = send(2, 'sub-2')
+    await clock.advance(1_000)
+    who.current = 'acct-3'
+    expect(await prompt()).toContain(SWITCHED)
+    const d = send(3)
+    await clock.advance(1_000)
+    await land(2, c)
+    await land(3, d)
+    expect(await prompt()).toContain(SWITCHED)
+
+    const f = send(4) // nothing from before the switch is out any more
+    await clock.advance(1_000)
+    await land(4, f)
+    expect(await prompt()).toContain('5-hour limit: 23.5% used')
+  })
+
   test('the second claude leaves out an API key the session does not run on', async ($, on) => {
     const seen = world(on)
     const KEY = 'sk-ant-api03-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbbbbbb'

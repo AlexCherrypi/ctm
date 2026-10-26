@@ -18,6 +18,8 @@ import type { IdleWatch, KeptBriefing, KeptIdleUpdates, KeptWakeups, LimitKind, 
 // 4. Lets the model see its own model and effort and the models it can switch to (with
 //    the engine's own descriptions where it can get them), and switch model and/or
 //    effort (on its own or together with a compact or clear) – again with a resume prompt.
+//    Turns Ultracode (the standing opt-in to multi-agent workflows, which no longer
+//    depends on the effort) on or off the same way.
 // 5. Settings the model (`settings` tool) or the person (/ctm, userConfig) can set:
 //    the update interval, a compact threshold (the blocks remind the model to compact
 //    once the context passes it; while it is unset they remind it now and then to ask
@@ -38,11 +40,13 @@ import type { IdleWatch, KeptBriefing, KeptIdleUpdates, KeptWakeups, LimitKind, 
 
 type Mode = 'compact' | 'clear'
 // What runs at the end of the turn, in this order: a compact or clear, a model switch,
-// an effort change (its levels depend on the model). Any of them may be left out.
+// an effort change (its levels depend on the model), Ultracode on or off (an effort
+// change may turn it off). Any of them may be left out.
 type PendingReset = {
   mode: Mode | null
   model: string | null
   effort: string | null
+  ultracode: boolean | null
   instructions: string | null
   resumePrompt: string
 }
@@ -76,6 +80,7 @@ const T_WAKEUP = 'mcp__ctm__limit_wakeup'
 const T_MODELS = 'mcp__ctm__models'
 const T_SWITCH = 'mcp__ctm__switch_model'
 const T_EFFORT = 'mcp__ctm__set_effort'
+const T_ULTRACODE = 'mcp__ctm__set_ultracode'
 // The account-switcher plugin's tools: where it is installed, a block past a pause mark
 // points the main agent to another of the person's accounts before asking it to pause.
 const T_SWITCHER_ACCOUNTS = 'mcp__account-switcher__accounts'
@@ -126,6 +131,8 @@ let lastTurnEndAt = 0
 let lastResetAt = Number.NEGATIVE_INFINITY
 let lastEffortAt = Number.NEGATIVE_INFINITY
 let lastEffort: string | null = null // the main loop's effort, as its last model request carried it
+let lastUltracodeAt = Number.NEGATIVE_INFINITY
+let lastUltracode: boolean | null = null // Ultracode as CTM last set it; null: not set by CTM
 // The engine's model list, kept for CATALOG_TTL_MS – a failed fetch too, so a host where
 // it does not work is not asked again on every call.
 let catalog: { at: number; list: Promise<CatalogEntry[] | null> } | null = null
@@ -176,7 +183,7 @@ let configIntervalMinutes = 3
 let configCompactThreshold = DEFAULT_COMPACT_THRESHOLD
 let configPauseAt: Record<LimitKind, number> = { five_hour: 0, seven_day: 0 }
 let cooldownMs = 10 * MINUTE // between two resets or model switches
-let effortCooldownMs = 10 * MINUTE // between two effort changes
+let effortCooldownMs = 10 * MINUTE // between two effort changes, and between two Ultracode changes
 let attachToPrompts = true
 let configuredTimeZone = ''
 let timeZone: string | null = null // resolved on the first report
@@ -204,7 +211,8 @@ const INFO = [
   'A good moment for compact/clear is right after finishing a sub-task, before the context gets tight – never in the middle of a change.',
   `- ${T_MODELS}: your current model and effort, and the models you can switch to with what each is good for. ${T_SWITCH}: switches the model at the end of your turn – alone or together with a compact/clear (cheaper: the new model then re-caches only the smaller conversation) – and sends you your resumePrompt afterwards, as a reset does. Switch to a smaller model for simple, routine work, to a larger one for hard problems.`,
   `- ${T_EFFORT}: raises or lowers how long you think, from the end of your turn on, then you carry on. Raise it when your solutions stay half-baked or the problem is harder than it looked; lower it for routine work.`,
-  '- If the user told you to stay on a model or an effort level, do not change it yourself.',
+  `- ${T_ULTRACODE}: turns Ultracode (multi-agent workflows on every substantive task) on or off for this session, from the end of your turn on, then you carry on. It does not depend on the effort. Turn it on for exhaustive work – broad audits, migrations, hard multi-part problems – and off for routine work or when a limit runs high: workflows cost far more quota.`,
+  '- If the user told you to stay on a model, an effort level or an Ultracode setting, do not change it yourself.',
   `- ${T_SETTINGS}: how often these blocks come (1–${MAX_INTERVAL_MINUTES} min), a compact threshold (tokens like 300k, or a % of the window), and pause thresholds for the 5-hour and 7-day limits. No arguments = show the current settings. Kept across sessions.`,
   '- Past the compact threshold the blocks remind you to compact: do it at the next clean point if your task allows it (a smaller context makes every further request cheaper on the limits) – never break off critical work for it.',
   '- Built-in safety net, always active and not configurable: from 95% of the 5-hour limit and 97% of the 7-day limit the blocks ask you to pause, even with no pause threshold set.',
@@ -1118,6 +1126,7 @@ async function switcherPresent($: EngineInterface, now: number): Promise<boolean
 type ModelInfo = {
   current: string | null
   effort: string | null
+  ultracode: boolean | null
   setting: string | null
   options: string[]
   catalog: CatalogEntry[] | null
@@ -1136,6 +1145,7 @@ async function modelInfo($: EngineInterface, withCatalog = true): Promise<ModelI
   return {
     current,
     effort: await currentEffort($),
+    ultracode: lastUltracode,
     setting: row?.value === undefined ? null : String(row.value),
     options,
     catalog: cat,
@@ -1153,6 +1163,7 @@ function describeModels(m: ModelInfo): string {
     'CTM models:',
     `- Current model (main agent): ${m.current ?? 'unknown'}`,
     `- Current effort: ${m.effort ?? 'unknown (the model may have no effort levels)'}`,
+    `- Ultracode: ${m.ultracode === null ? 'not changed by CTM in this session (the system reminders say whether it is on)' : m.ultracode ? 'on' : 'off'}`,
   ]
   if (m.setting !== null) lines.push(`- Model setting: ${m.setting}`)
   if (m.catalog) {
@@ -1175,7 +1186,7 @@ function describeModels(m: ModelInfo): string {
   lines.push(
     `Switch with ${T_SWITCH} (at the end of your turn, with a resumePrompt). It is for this session only; the ` +
       'prompt cache is rebuilt on the new model, so combine it with a compact or clear when the context is large. ' +
-      `Effort: ${T_EFFORT}.`,
+      `Effort: ${T_EFFORT}. Ultracode: ${T_ULTRACODE}.`,
   )
   return lines.join('\n')
 }
@@ -1289,7 +1300,7 @@ async function switchModel($: EngineInterface, model: string): Promise<{ ok: boo
 
 // Sets the effort through /effort <level> – for this session only – and checks the
 // answer: "Set effort level to …" / "Effort level set to …" on success.
-async function setEffort($: EngineInterface, level: string): Promise<{ ok: boolean; note: string }> {
+async function setEffort($: EngineInterface, level: string): Promise<{ ok: boolean; note: string; ultracodeOff?: boolean }> {
   const before = await currentEffort($)
   let text = ''
   try {
@@ -1302,7 +1313,14 @@ async function setEffort($: EngineInterface, level: string): Promise<{ ok: boole
   if (/^(set effort level to|effort level set to)\b/i.test(text)) {
     if (level !== 'auto') lastEffort = level
     else lastEffort = null
-    return { ok: true, note: `[CTM] Your effort was set as you scheduled: now ${level}${before && before !== level ? ` (was ${before})` : ''}.` }
+    // Where the engine turns Ultracode off with an effort change, its answer says so.
+    const offToo = /·\s*ultracode off\b/i.test(text)
+    if (offToo) lastUltracode = false
+    return {
+      ok: true,
+      note: `[CTM] Your effort was set as you scheduled: now ${level}${before && before !== level ? ` (was ${before})` : ''}.`,
+      ultracodeOff: offToo,
+    }
   }
   return {
     ok: false,
@@ -1312,10 +1330,41 @@ async function setEffort($: EngineInterface, level: string): Promise<{ ok: boole
   }
 }
 
+// Turns Ultracode on or off through /effort ultracode on|off – for this session only –
+// and checks the answer: "Ultracode on (this session only): …" / "Ultracode off. …" on
+// success. Where it is not available (dynamic workflows off, a model without it) the
+// engine says so and changes nothing.
+async function setUltracode($: EngineInterface, on: boolean): Promise<{ ok: boolean; note: string }> {
+  const args = `ultracode ${on ? 'on' : 'off'}`
+  let text = ''
+  try {
+    const r = await $.command.run({ command: 'effort', args })
+    refusedBy(r)
+    text = (r.text ?? '').trim()
+  } catch (err) {
+    text = errorText(err)
+  }
+  if ((on ? /^ultracode on\b/i : /^ultracode off\b/i).test(text)) {
+    lastUltracode = on
+    return { ok: true, note: `[CTM] Ultracode was turned ${on ? 'on' : 'off'} as you scheduled.` }
+  }
+  return {
+    ok: false,
+    note:
+      `[CTM] Turning Ultracode ${on ? 'on' : 'off'} as you scheduled failed. Command: /effort ${args} – the engine ` +
+      `answered: ${text ? `"${text}"` : 'nothing'}. Ultracode is unchanged.`,
+  }
+}
+
 // ---------------------------------------------------------------- Reset (runs after the turn)
 
-function describeJob(job: { mode: Mode | null; model: string | null; effort: string | null }): string {
-  return [job.mode, job.model ? `model switch to ${job.model}` : null, job.effort ? `effort ${job.effort}` : null]
+function describeJob(job: { mode: Mode | null; model: string | null; effort: string | null; ultracode: boolean | null }): string {
+  return [
+    job.mode,
+    job.model ? `model switch to ${job.model}` : null,
+    job.effort ? `effort ${job.effort}` : null,
+    job.ultracode === null ? null : `Ultracode ${job.ultracode ? 'on' : 'off'}`,
+  ]
     .filter(Boolean)
     .join(' + ')
 }
@@ -1326,7 +1375,9 @@ async function resetMessage($: EngineInterface, job: PendingReset, note: string)
   const effort = await currentEffort($)
   return [
     note,
-    ...(model ? [`Current model: ${model}${effort ? `, effort ${effort}` : ''}`] : []),
+    ...(model
+      ? [`Current model: ${model}${effort ? `, effort ${effort}` : ''}${lastUltracode === null ? '' : `, Ultracode ${lastUltracode ? 'on' : 'off'}`}`]
+      : []),
     '',
     INFO,
     '',
@@ -1372,10 +1423,19 @@ async function deliverResume($: EngineInterface, job: PendingReset, note: string
     const ef = await setEffort($, job.effort)
     if (!ef.ok) toast($, `CTM: effort change failed – ${job.effort}`)
     note = note ? `${note}\n${ef.note}` : ef.note
+    if (ef.ultracodeOff && job.ultracode === null) {
+      note += `\n[CTM] The engine turned Ultracode off with the effort change (${T_ULTRACODE} turns it on again).`
+    }
+  }
+  if (job.ultracode !== null) {
+    const uc = await setUltracode($, job.ultracode)
+    if (!uc.ok) toast($, `CTM: Ultracode ${job.ultracode ? 'on' : 'off'} failed`)
+    note = note ? `${note}\n${uc.note}` : uc.note
   }
   const now = await $.clock.now()
   if (job.mode || job.model) lastResetAt = now
   if (job.effort) lastEffortAt = now
+  if (job.ultracode !== null) lastUltracodeAt = now
   lastSent.set('main', now)
   await $.prompt.submit({ text: await resetMessage($, job, note) })
 }
@@ -1385,7 +1445,11 @@ async function failReset($: EngineInterface, job: PendingReset, message: string)
   awaitTimer?.cancel()
   awaitTimer = null
   toast($, `CTM: ${job.mode} failed – ${message}`)
-  const rest = [job.model ? `model switch to "${job.model}"` : null, job.effort ? `effort change to "${job.effort}"` : null]
+  const rest = [
+    job.model ? `model switch to "${job.model}"` : null,
+    job.effort ? `effort change to "${job.effort}"` : null,
+    job.ultracode === null ? null : `Ultracode ${job.ultracode ? 'on' : 'off'}`,
+  ]
     .filter(Boolean)
     .join(' and ')
   const skipped = rest ? ` The ${rest} was skipped as well.` : ''
@@ -1437,7 +1501,7 @@ async function runReset($: EngineInterface): Promise<void> {
   if (busy) return // a new turn is already running: try again at its turn.complete
   pending = null
 
-  if (job.mode === null) return deliverResume($, job, '') // a model and/or effort change alone
+  if (job.mode === null) return deliverResume($, job, '') // a model, effort and/or Ultracode change alone
   if (job.mode === 'clear') return runAsCommand($, { ...job, mode: job.mode })
 
   try {
@@ -1968,6 +2032,36 @@ export const register: Register = (on, options) => {
       },
       isDeferred: false,
     })
+    await $.tool.register({
+      name: 'set_ultracode',
+      description:
+        'CTM: Turns Ultracode on or off from the END of your current turn on – for this session only – then you ' +
+        'automatically get a message and carry on (with resumePrompt if you give one). Finish your answer promptly ' +
+        'after calling this. Ultracode is the standing opt-in to multi-agent workflows: while it is on, you run a ' +
+        'workflow for every substantive task. It does not depend on your effort; set that separately with ' +
+        `${T_EFFORT}.\n` +
+        '- Turn it on for work that gains from many agents: broad audits or reviews, migrations, research across ' +
+        'many sources, hard problems that need independent attempts and adversarial checks.\n' +
+        '- Turn it off for routine or conversational work, or when a limit runs high – workflows cost far more ' +
+        'quota than working alone.\n' +
+        '- If the user told you to keep Ultracode on or off, do not change it on your own.\n' +
+        `At least ${effortCooldownMs / MINUTE} minutes between two Ultracode changes. Main agent only.`,
+      inputSchema: {
+        type: 'object',
+        properties: {
+          enabled: { type: 'boolean', description: 'true: Ultracode on; false: off.' },
+          resumePrompt: {
+            type: 'string',
+            description:
+              'Optional: what to continue with once Ultracode is on or off. Your conversation stays as it is, ' +
+              'so the next step is enough. Left out: you are told to carry on where you left off.',
+          },
+        },
+        required: ['enabled'],
+        additionalProperties: false,
+      },
+      isDeferred: false,
+    })
     await safe(() =>
       $.command.register({
         name: 'ctm',
@@ -2154,7 +2248,7 @@ export const register: Register = (on, options) => {
     if (wait > 0) return { deny: `CTM: the last reset was too recent. Next one possible ${fmtIn(wait)}.` }
 
     const replaced = pending !== null
-    pending = { mode, model: null, effort: null, instructions: mode === 'compact' ? instructions : null, resumePrompt }
+    pending = { mode, model: null, effort: null, ultracode: null, instructions: mode === 'compact' ? instructions : null, resumePrompt }
     toast($, `CTM: the model scheduled a ${mode} for the end of this turn`)
     return {
       result:
@@ -2308,7 +2402,7 @@ export const register: Register = (on, options) => {
         deny: `CTM: ${model} does not support effort "${effort}" (it supports ${target.supportedEffortLevels.join(', ')}) – nothing was scheduled.`,
       }
     }
-    pending = { mode, model, effort, instructions: mode === 'compact' ? instructions : null, resumePrompt }
+    pending = { mode, model, effort, ultracode: null, instructions: mode === 'compact' ? instructions : null, resumePrompt }
     toast($, `CTM: the model scheduled a ${describeJob(pending)} for the end of this turn`)
     return {
       result:
@@ -2348,7 +2442,7 @@ export const register: Register = (on, options) => {
     // Joins a reset or model switch already scheduled for this turn; else stands alone.
     pending = pending
       ? { ...pending, effort: level, resumePrompt: given ? `${pending.resumePrompt}\n\n${given}` : pending.resumePrompt }
-      : { mode: null, model: null, effort: level, instructions: null, resumePrompt }
+      : { mode: null, model: null, effort: level, ultracode: null, instructions: null, resumePrompt }
     toast($, `CTM: the model scheduled effort ${level} for the end of this turn`)
     return {
       result:
@@ -2357,6 +2451,32 @@ export const register: Register = (on, options) => {
         'Finish your answer now; you will then get a message to carry on.',
     }
   }).catch(() => ({ deny: 'CTM: could not schedule the effort change.' }))
+
+  on('tool.call', { tool: T_ULTRACODE }, async ($, e) => {
+    if (e.agentId) return { deny: 'CTM: only the main agent may turn Ultracode on or off.' }
+    const input = e as unknown as { enabled?: unknown; resumePrompt?: unknown }
+    const enabled = input.enabled
+    if (typeof enabled !== 'boolean') return { deny: 'CTM: "enabled" must be true or false.' }
+    const now = await $.clock.now()
+    const wait = lastUltracodeAt + effortCooldownMs - now
+    if (wait > 0) return { deny: `CTM: the last Ultracode change was too recent. Next one possible ${fmtIn(wait)}.` }
+    const state = enabled ? 'on' : 'off'
+    const given = typeof input.resumePrompt === 'string' ? input.resumePrompt.trim() : ''
+    const resumePrompt = given || `Carry on with your task where you left off, now with Ultracode ${state}.`
+
+    const replaced = pending !== null
+    // Joins a reset, model switch or effort change already scheduled for this turn; else stands alone.
+    pending = pending
+      ? { ...pending, ultracode: enabled, resumePrompt: given ? `${pending.resumePrompt}\n\n${given}` : pending.resumePrompt }
+      : { mode: null, model: null, effort: null, ultracode: enabled, instructions: null, resumePrompt }
+    toast($, `CTM: the model scheduled Ultracode ${state} for the end of this turn`)
+    return {
+      result:
+        `CTM: Ultracode ${state} scheduled for the end of this turn` +
+        `${replaced ? '; added to the reset, switch or effort change already scheduled' : ''}. ` +
+        'Finish your answer now; you will then get a message to carry on.',
+    }
+  }).catch(() => ({ deny: 'CTM: could not schedule the Ultracode change.' }))
 
   // The main loop's effort, as each of its model requests carries it. A main step also
   // means a main turn runs – a fresh copy of the module may not have heard its start.

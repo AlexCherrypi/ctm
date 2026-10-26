@@ -64,6 +64,9 @@ type WorldOpts = {
   catalog?: boolean
   refuseEffort?: string
   effort?: string
+  refuseUltracode?: string
+  // As in a remote session: an effort change turns Ultracode off, and says so.
+  effortTurnsUltracodeOff?: boolean
 }
 
 function world(on: On, initial: Usage = USAGE, opts: WorldOpts = {}) {
@@ -142,8 +145,13 @@ function world(on: On, initial: Usage = USAGE, opts: WorldOpts = {}) {
   on('command.run', (_$, e) => {
     seen.commands.push(e.args ? `${e.command} ${e.args}` : e.command)
     if (e.command === 'effort') {
+      const uc = /^ultracode (on|off)$/.exec(e.args)
+      if (uc) {
+        if (opts.refuseUltracode) return { text: opts.refuseUltracode }
+        return { text: uc[1] === 'on' ? 'Ultracode on (this session only): …. Effort stays high.' : 'Ultracode off. Effort stays high.' }
+      }
       if (opts.refuseEffort) return { text: opts.refuseEffort }
-      return { text: `Set effort level to ${e.args} (this session only): …` }
+      return { text: `Set effort level to ${e.args} (this session only): …${opts.effortTurnsUltracodeOff ? ' · Ultracode off' : ''}` }
     }
     if (e.command === 'model') {
       // As /model answers: an unknown name or a policy refusal leaves the model as it was.
@@ -1221,6 +1229,95 @@ describe('set_effort', () => {
     expect(seen.prompts[0]).toContain('now claude-haiku-5-5 (was claude-opus-5-5)')
     expect(seen.prompts[0]).toContain('now low (was medium)')
     expect(seen.prompts[0]).toContain('after model switch to haiku + effort low')
+  })
+})
+
+describe('set_ultracode', () => {
+  const uc = (extra: Record<string, unknown>) => ({ tool: 'mcp__ctm__set_ultracode', ...extra }) as never
+
+  test('refuses anything but true or false, and subagents', async ($, on) => {
+    world(on)
+    mock.clock(on, { now: 1_000_000 })
+    expect((await $.tool.call(uc({ enabled: 'on' }))).deny).toMatch(/"enabled" must be true or false/)
+    expect((await $.tool.call(uc({ enabled: true, agentId: 'sub-1' }))).deny).toMatch(/main agent/)
+  })
+
+  test('turns Ultracode on after the turn through /effort ultracode on and tells the model to carry on', async ($, on) => {
+    const seen = world(on, USAGE, { effort: 'high' })
+    const clock = mock.clock(on, { now: 1_000_000 })
+    on('turn.complete', () => ({ text: '' }) as never)
+
+    const r = await $.tool.call(uc({ enabled: true }))
+    expect(String(r.result)).toContain('Ultracode on scheduled for the end of this turn')
+    await $.turn.complete(turn)
+    await clock.advance(2_000)
+
+    expect(seen.commands).toEqual(['effort ultracode on'])
+    expect(seen.prompts.length).toBe(1)
+    expect(seen.prompts[0]).toContain('[CTM] Ultracode was turned on as you scheduled.')
+    expect(seen.prompts[0]).toContain('Current model: claude-opus-5-5, effort high, Ultracode on')
+    expect(seen.prompts[0]).toContain('now with Ultracode on')
+
+    // its own cooldown – an effort change is still possible
+    expect((await $.tool.call(uc({ enabled: false }))).deny).toMatch(/last Ultracode change was too recent/)
+    expect((await $.tool.call({ tool: 'mcp__ctm__set_effort', level: 'max' } as never)).deny).toBeUndefined()
+  })
+
+  test('a refused change names the command and the answer', async ($, on) => {
+    const seen = world(on, USAGE, { refuseUltracode: 'Ultracode needs dynamic workflows enabled (see /config). Valid options are: …' })
+    const clock = mock.clock(on, { now: 1_000_000 })
+    on('turn.complete', () => ({ text: '' }) as never)
+    await $.tool.call(uc({ enabled: true, resumePrompt: 'Next step: audit the parser.' }))
+    await $.turn.complete(turn)
+    await clock.advance(2_000)
+    expect(seen.prompts[0]).toContain(
+      '[CTM] Turning Ultracode on as you scheduled failed. Command: /effort ultracode on – the engine answered: "Ultracode needs dynamic workflows enabled (see /config). Valid options are: …". Ultracode is unchanged.',
+    )
+    expect(seen.prompts[0]).toContain('Next step: audit the parser.')
+  })
+
+  test('joins an effort change in the same turn, effort first – an effort change may turn Ultracode off', async ($, on) => {
+    const seen = world(on, USAGE, { effort: 'medium', effortTurnsUltracodeOff: true })
+    const clock = mock.clock(on, { now: 1_000_000 })
+    on('turn.complete', () => ({ text: '' }) as never)
+    await $.tool.call(uc({ enabled: true }))
+    const r = await $.tool.call({ tool: 'mcp__ctm__set_effort', level: 'xhigh' } as never)
+    expect(String(r.result)).toContain('added to the reset or switch already scheduled')
+    await $.turn.complete(turn)
+    await clock.advance(2_000)
+    expect(seen.commands).toEqual(['effort xhigh', 'effort ultracode on'])
+    expect(seen.prompts.length).toBe(1)
+    expect(seen.prompts[0]).toContain('after effort xhigh + Ultracode on')
+    expect(seen.prompts[0]).not.toContain('turned Ultracode off')
+  })
+
+  test('an effort change alone that turns Ultracode off says so', async ($, on) => {
+    const seen = world(on, USAGE, { effort: 'medium', effortTurnsUltracodeOff: true })
+    const clock = mock.clock(on, { now: 1_000_000 })
+    on('turn.complete', () => ({ text: '' }) as never)
+    await $.tool.call({ tool: 'mcp__ctm__set_effort', level: 'high' } as never)
+    await $.turn.complete(turn)
+    await clock.advance(2_000)
+    expect(seen.prompts[0]).toContain('The engine turned Ultracode off with the effort change (mcp__ctm__set_ultracode turns it on again).')
+    expect(seen.prompts[0]).toContain('effort high, Ultracode off')
+  })
+
+  test('the models tool shows Ultracode as CTM set it', async ($, on) => {
+    world(on)
+    const clock = mock.clock(on, { now: 1_000_000 })
+    on('turn.complete', () => ({ text: '' }) as never)
+    expect(String((await $.tool.call({ tool: 'mcp__ctm__models' } as never)).result)).toContain('- Ultracode: not changed by CTM')
+    await $.tool.call(uc({ enabled: true }))
+    await $.turn.complete(turn)
+    await clock.advance(2_000)
+    expect(String((await $.tool.call({ tool: 'mcp__ctm__models' } as never)).result)).toContain('- Ultracode: on')
+  })
+
+  test('the tool is registered', async ($, on) => {
+    const seen = world(on)
+    on('session.start', () => ({ cwd: '/' }) as never)
+    await $.session.start({ cwd: '/' } as never)
+    expect(seen.tools.map(t => t.name)).toEqual(expect.arrayContaining(['set_effort', 'set_ultracode']))
   })
 })
 

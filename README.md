@@ -2,8 +2,8 @@
 
 A Claude Code mod that keeps the model informed about its context window and the account's
 5-hour / 7-day rate limits, each with its change since the last report, in a short block – and
-lets the model compact or clear its own conversation, switch its own model or change its own
-effort, always with a resume prompt so it carries on afterwards.
+lets the model compact or clear its own conversation, switch its own model, change its own
+effort or turn Ultracode on or off, always with a resume prompt so it carries on afterwards.
 
 ## What the model sees
 
@@ -59,7 +59,7 @@ legend is then in the system prompt as usual.
 | On every prompt you send | The current figures (turn off with `attachToPrompts`). |
 | While it works | At most every `intervalMinutes` (default 3, changeable by the model and by you) on a tool result, tracked per agent – and at once on the next tool result when a pause threshold is newly passed. |
 | While idle, if it turned that on | A wake-up prompt with the figures every `intervalMinutes` (each starts a turn). |
-| After a CTM compact/clear/model switch/effort change | What happened, the model and effort it now runs on, the CTM briefing, its resume prompt and the current figures. |
+| After a CTM compact/clear/model switch/effort or Ultracode change | What happened, the model and effort it now runs on, the CTM briefing, its resume prompt and the current figures. |
 
 ## Tools for the model
 
@@ -137,8 +137,25 @@ legend is then in the system prompt as usual.
     model switch scheduled in the same turn; dropped if you interrupt the turn.
   - The current effort is read from the model requests themselves (`turn.step`), so it is exact
     after any change, yours included.
+- `mcp__ctm__set_ultracode` `{ enabled, resumePrompt? }` – turns Ultracode (the standing opt-in to
+  multi-agent workflows on every substantive task) on or off. Since recent Claude Code versions
+  Ultracode no longer depends on the effort, so the model sets the two separately: on for broad
+  audits, migrations or hard multi-part problems, off for routine work or when a limit runs high.
+  Rules, as for the effort:
+  - Runs as `/effort ultracode on|off` at the end of the turn, **for this session only**; then the
+    model gets a message to carry on (its `resumePrompt`, or "carry on where you left off").
+  - Where Ultracode is not available (dynamic workflows off in `/config`, a model without it) the
+    engine's answer comes back verbatim with the command, Ultracode unchanged.
+  - If you told the model to keep Ultracode on or off, it is told not to change it itself.
+  - Main agent only; its own gap between two Ultracode changes (the same `effortCooldownMinutes`,
+    timed apart from the effort's), so effort and Ultracode can change in the same turn; joins a
+    reset, model switch or effort change scheduled in that turn – it runs last, as an effort change
+    can turn Ultracode off. Where the engine does turn it off with an effort change, the model is
+    told so. Dropped if you interrupt the turn.
+  - `mcp__ctm__models` shows Ultracode as CTM last set it; until then the engine's own system
+    reminders tell the model whether it is on.
 
-You get a toast whenever the model schedules a reset, a model switch or an effort change, turns idle updates on, changes the
+You get a toast whenever the model schedules a reset, a model switch, an effort or Ultracode change, turns idle updates on, changes the
 settings, or arms or fires a limit wake-up.
 
 ## Thresholds and wake-ups
@@ -217,7 +234,7 @@ The model is told when you change them.
 | `fiveHourPauseAt` | 0 | Pause threshold for the 5-hour limit in percent, 0 = off |
 | `sevenDayPauseAt` | 0 | Pause threshold for the 7-day limit in percent, 0 = off |
 | `resetCooldownMinutes` | 10 | Minimum time between two compact/clear/model switches (one shared gap), 0 = none |
-| `effortCooldownMinutes` | 10 | Minimum time between two effort changes, independent of the one above, 0 = none |
+| `effortCooldownMinutes` | 10 | Minimum time between two effort changes, and between two Ultracode changes (each timed on its own), independent of the one above, 0 = none |
 | `attachToPrompts` | true | Attach the figures to your own prompts |
 | `timeZone` | empty | IANA zone for every time shown, e.g. `Europe/Berlin`. Empty = automatic: `TZ`, then `/etc/localtime` or `/etc/timezone`, then the system zone, else UTC |
 

@@ -1291,6 +1291,29 @@ describe('set_ultracode', () => {
     expect(seen.prompts[0]).not.toContain('turned Ultracode off')
   })
 
+  test('a reset or model switch scheduled after it keeps the Ultracode change', async ($, on) => {
+    const seen = world(on)
+    const clock = mock.clock(on, { now: 1_000_000 })
+    on('turn.complete', () => ({ text: '' }) as never)
+    await $.tool.call(uc({ enabled: true }))
+    await $.tool.call({ tool: 'mcp__ctm__switch_model', model: 'haiku', resumePrompt: RESUME } as never)
+    await $.turn.complete(turn)
+    await clock.advance(2_000)
+    expect(seen.commands).toEqual(['model haiku', 'effort ultracode on'])
+  })
+
+  test('a failed Ultracode on after an effort change that turned it off says it is off', async ($, on) => {
+    const seen = world(on, USAGE, { effortTurnsUltracodeOff: true, refuseUltracode: "Ultracode isn't available on claude-opus-5-5." })
+    const clock = mock.clock(on, { now: 1_000_000 })
+    on('turn.complete', () => ({ text: '' }) as never)
+    await $.tool.call({ tool: 'mcp__ctm__set_effort', level: 'high' } as never)
+    await $.tool.call(uc({ enabled: true }))
+    await $.turn.complete(turn)
+    await clock.advance(2_000)
+    expect(seen.prompts[0]).toContain('Ultracode is off: the effort change before it turned it off.')
+    expect(seen.prompts[0]).not.toContain('Ultracode is unchanged.')
+  })
+
   test('an effort change alone that turns Ultracode off says so', async ($, on) => {
     const seen = world(on, USAGE, { effort: 'medium', effortTurnsUltracodeOff: true })
     const clock = mock.clock(on, { now: 1_000_000 })

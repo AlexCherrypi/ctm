@@ -1,6 +1,6 @@
 {
   "name": "ctm",
-  "version": "0.13.0",
+  "version": "0.13.1",
   "description": "Context and Token Manager: keeps the model informed about its context window and the 5-hour / 7-day rate limits, each with its change since the last report, and lets it compact or clear itself, switch its own model, change its own effort or turn Ultracode on or off – always with a resume prompt.",
   "author": {
     "name": "AlexCherrypi"

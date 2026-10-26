@@ -1419,8 +1419,10 @@ async function deliverResume($: EngineInterface, job: PendingReset, note: string
     if (!sw.ok) toast($, `CTM: model switch failed – ${job.model}`)
     note = note ? `${note}\n${sw.note}` : sw.note
   }
+  let ultracodeOff = false // the effort change turned Ultracode off
   if (job.effort) {
     const ef = await setEffort($, job.effort)
+    ultracodeOff = ef.ultracodeOff === true
     if (!ef.ok) toast($, `CTM: effort change failed – ${job.effort}`)
     note = note ? `${note}\n${ef.note}` : ef.note
     if (ef.ultracodeOff && job.ultracode === null) {
@@ -1430,7 +1432,8 @@ async function deliverResume($: EngineInterface, job: PendingReset, note: string
   if (job.ultracode !== null) {
     const uc = await setUltracode($, job.ultracode)
     if (!uc.ok) toast($, `CTM: Ultracode ${job.ultracode ? 'on' : 'off'} failed`)
-    note = note ? `${note}\n${uc.note}` : uc.note
+    const fix = !uc.ok && ultracodeOff ? uc.note.replace('Ultracode is unchanged.', 'Ultracode is off: the effort change before it turned it off.') : uc.note
+    note = note ? `${note}\n${fix}` : fix
   }
   const now = await $.clock.now()
   if (job.mode || job.model) lastResetAt = now
@@ -2248,7 +2251,7 @@ export const register: Register = (on, options) => {
     if (wait > 0) return { deny: `CTM: the last reset was too recent. Next one possible ${fmtIn(wait)}.` }
 
     const replaced = pending !== null
-    pending = { mode, model: null, effort: null, ultracode: null, instructions: mode === 'compact' ? instructions : null, resumePrompt }
+    pending = { mode, model: null, effort: null, ultracode: pending?.ultracode ?? null, instructions: mode === 'compact' ? instructions : null, resumePrompt }
     toast($, `CTM: the model scheduled a ${mode} for the end of this turn`)
     return {
       result:
@@ -2402,7 +2405,7 @@ export const register: Register = (on, options) => {
         deny: `CTM: ${model} does not support effort "${effort}" (it supports ${target.supportedEffortLevels.join(', ')}) – nothing was scheduled.`,
       }
     }
-    pending = { mode, model, effort, ultracode: null, instructions: mode === 'compact' ? instructions : null, resumePrompt }
+    pending = { mode, model, effort, ultracode: pending?.ultracode ?? null, instructions: mode === 'compact' ? instructions : null, resumePrompt }
     toast($, `CTM: the model scheduled a ${describeJob(pending)} for the end of this turn`)
     return {
       result:

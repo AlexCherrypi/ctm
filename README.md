@@ -160,13 +160,17 @@ legend is then in the system prompt as usual.
   - Runs as `/remote-control` at the end of the turn, **for this session only**; then the model gets
     a message with the result and carries on (its `resumePrompt`, or "carry on and tell the user how
     it went").
-  - `/remote-control` is a toggle and plugins cannot read its state, so CTM reads the engine's
-    answer: if it went the other way (Remote Control already was as asked), CTM runs it once more
-    to put it back.
+  - `/remote-control` is a toggle without on/off. CTM reads the state from the command list
+    (while connected, the engine describes `/remote-control` as "Disconnect Remote Control"):
+    already as asked → nothing runs; afterwards the list confirms the change. Where the list cannot
+    be read, CTM goes by the engine's answer and, if it went the other way, runs it once more.
   - If it fails (not available in this session, disabled by the organization, not signed in, …),
     the engine's answer comes back verbatim, so the model can report it.
   - Main agent only, no gap; joins a reset, model switch, effort or Ultracode change scheduled in
-    the same turn and runs last. `mcp__ctm__models` shows its state as CTM last saw it.
+    the same turn and runs last. `mcp__ctm__models` shows its state too.
+- `mcp__ctm__remote_control_status` `{}` – answers at once whether Remote Control is on, off or not
+  available in this session (read from the command list as above), plus a change scheduled for the
+  end of the turn.
 
 You get a toast whenever the model schedules a reset, a model switch, an effort, Ultracode or Remote Control change, turns idle updates on, changes the
 settings, or arms or fires a limit wake-up.

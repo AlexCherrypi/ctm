@@ -67,6 +67,8 @@ type WorldOpts = {
   refuseUltracode?: string
   remoteOn?: boolean // Remote Control connected at the start
   refuseRemote?: string // what /remote-control answers where it is not available
+  noRemote?: boolean // no /remote-control command in this session
+  noCommandList?: boolean // $.command.list refused
   // As in a remote session: an effort change turns Ultracode off, and says so.
   effortTurnsUltracodeOff?: boolean
 }
@@ -170,6 +172,18 @@ function world(on: On, initial: Usage = USAGE, opts: WorldOpts = {}) {
       return { text: `Set model to \`${id}\` for this session only` }
     }
     return { text: '' }
+  })
+  on('command.list', () => {
+    if (opts.noCommandList) throw new Error('$.command.list: not available')
+    const list = [{ name: 'effort', description: 'Set effort level', source: 'built-in' }]
+    if (!opts.noRemote) {
+      list.push({
+        name: 'remote-control',
+        description: opts.remoteOn ? 'Disconnect Remote Control' : 'Control this session from your phone or claude.ai/code',
+        source: 'built-in',
+      })
+    }
+    return { value: list } as never
   })
   on('prompt.submit', (_$, e) => {
     if (seen.refusePrompts.on) throw new Error('the prompt queue is closed')
@@ -1376,7 +1390,7 @@ describe('remote_control', () => {
   })
 
   test('already as asked: the toggle is run again to put it back', async ($, on) => {
-    const seen = world(on, USAGE, { remoteOn: true })
+    const seen = world(on, USAGE, { remoteOn: true, noCommandList: true })
     const clock = mock.clock(on, { now: 1_000_000 })
     on('turn.complete', () => ({ text: '' }) as never)
     await $.tool.call(rc({ enabled: true }))
@@ -1384,6 +1398,36 @@ describe('remote_control', () => {
     await clock.advance(2_000)
     expect(seen.commands).toEqual(['remote-control', 'remote-control'])
     expect(seen.prompts[0]).toContain('[CTM] Remote Control was already on; it stays on.')
+  })
+
+  test('already as asked and the command list shows it: nothing is run', async ($, on) => {
+    const seen = world(on, USAGE, { remoteOn: true })
+    const clock = mock.clock(on, { now: 1_000_000 })
+    on('turn.complete', () => ({ text: '' }) as never)
+    await $.tool.call(rc({ enabled: true }))
+    await $.turn.complete(turn)
+    await clock.advance(2_000)
+    expect(seen.commands).toEqual([])
+    expect(seen.prompts[0]).toContain('[CTM] Remote Control was already on; nothing to do.')
+  })
+
+  test('remote_control_status reads the state right away', async ($, on) => {
+    const opts = { remoteOn: false }
+    world(on, USAGE, opts)
+    mock.clock(on, { now: 1_000_000 })
+    const st = () => $.tool.call({ tool: 'mcp__ctm__remote_control_status' } as never).then(r => String(r.result))
+    expect(await st()).toBe('CTM Remote Control: off.')
+    opts.remoteOn = true
+    expect(await st()).toContain('CTM Remote Control: on (connected')
+    await $.tool.call(rc({ enabled: false }))
+    expect(await st()).toContain('Scheduled for the end of this turn: Remote Control off.')
+  })
+
+  test('remote_control_status where there is no Remote Control', async ($, on) => {
+    world(on, USAGE, { noRemote: true })
+    mock.clock(on, { now: 1_000_000 })
+    const r = await $.tool.call({ tool: 'mcp__ctm__remote_control_status' } as never)
+    expect(String(r.result)).toContain('not available in this session')
   })
 
   test('turns it off', async ($, on) => {
@@ -1406,7 +1450,7 @@ describe('remote_control', () => {
     await clock.advance(2_000)
     expect(seen.commands).toEqual(['remote-control'])
     expect(seen.prompts[0]).toContain(
-      `[CTM] Turning Remote Control on as you scheduled failed. Command: /remote-control – the engine answered: "Remote Control is disabled by your organization's policy.". Remote Control is taken as unchanged.`,
+      `[CTM] Turning Remote Control on as you scheduled failed. Command: /remote-control – the engine answered: "Remote Control is disabled by your organization's policy.". Remote Control is still off.`,
     )
   })
 
@@ -1425,7 +1469,7 @@ describe('remote_control', () => {
     const seen = world(on)
     on('session.start', () => ({ cwd: '/' }) as never)
     await $.session.start({ cwd: '/' } as never)
-    expect(seen.tools.map(t => t.name)).toEqual(expect.arrayContaining(['remote_control']))
+    expect(seen.tools.map(t => t.name)).toEqual(expect.arrayContaining(['remote_control', 'remote_control_status']))
   })
 })
 

@@ -83,6 +83,7 @@ const T_SWITCH = 'mcp__ctm__switch_model'
 const T_EFFORT = 'mcp__ctm__set_effort'
 const T_ULTRACODE = 'mcp__ctm__set_ultracode'
 const T_REMOTE = 'mcp__ctm__remote_control'
+const T_REMOTE_STATUS = 'mcp__ctm__remote_control_status'
 // The account-switcher plugin's tools: where it is installed, a block past a pause mark
 // points the main agent to another of the person's accounts before asking it to pause.
 const T_SWITCHER_ACCOUNTS = 'mcp__account-switcher__accounts'
@@ -215,7 +216,7 @@ const INFO = [
   `- ${T_MODELS}: your current model and effort, and the models you can switch to with what each is good for. ${T_SWITCH}: switches the model at the end of your turn – alone or together with a compact/clear (cheaper: the new model then re-caches only the smaller conversation) – and sends you your resumePrompt afterwards, as a reset does. Switch to a smaller model for simple, routine work, to a larger one for hard problems.`,
   `- ${T_EFFORT}: raises or lowers how long you think, from the end of your turn on, then you carry on. Raise it when your solutions stay half-baked or the problem is harder than it looked; lower it for routine work.`,
   `- ${T_ULTRACODE}: turns Ultracode (multi-agent workflows on every substantive task) on or off for this session, from the end of your turn on, then you carry on. It does not depend on the effort. Turn it on for exhaustive work – broad audits, migrations, hard multi-part problems – and off for routine work or when a limit runs high: workflows cost far more quota.`,
-  `- ${T_REMOTE}: turns Remote Control (this session controlled from the phone or claude.ai/code) on or off at the end of your turn; you then get the result – including the engine's answer if it failed – and carry on. Use it when the user or your instructions ask for it.`,
+  `- ${T_REMOTE}: turns Remote Control (this session controlled from the phone or claude.ai/code) on or off at the end of your turn; you then get the result – including the engine's answer if it failed – and carry on. Use it when the user or your instructions ask for it. ${T_REMOTE_STATUS}: whether Remote Control is on right now.`,
   '- If the user told you to stay on a model, an effort level or an Ultracode setting, do not change it yourself.',
   `- ${T_SETTINGS}: how often these blocks come (1–${MAX_INTERVAL_MINUTES} min), a compact threshold (tokens like 300k, or a % of the window), and pause thresholds for the 5-hour and 7-day limits. No arguments = show the current settings. Kept across sessions.`,
   '- Past the compact threshold the blocks remind you to compact: do it at the next clean point if your task allows it (a smaller context makes every further request cheaper on the limits) – never break off critical work for it.',
@@ -1131,6 +1132,7 @@ type ModelInfo = {
   current: string | null
   effort: string | null
   ultracode: boolean | null
+  remote: RemoteState | null
   setting: string | null
   options: string[]
   catalog: CatalogEntry[] | null
@@ -1150,6 +1152,7 @@ async function modelInfo($: EngineInterface, withCatalog = true): Promise<ModelI
     current,
     effort: await currentEffort($),
     ultracode: lastUltracode,
+    remote: await remoteStatus($),
     setting: row?.value === undefined ? null : String(row.value),
     options,
     catalog: cat,
@@ -1168,7 +1171,7 @@ function describeModels(m: ModelInfo): string {
     `- Current model (main agent): ${m.current ?? 'unknown'}`,
     `- Current effort: ${m.effort ?? 'unknown (the model may have no effort levels)'}`,
     `- Ultracode: ${m.ultracode === null ? 'not changed by CTM in this session (the system reminders say whether it is on)' : m.ultracode ? 'on' : 'off'}`,
-    `- Remote Control: ${lastRemoteControl === null ? `not changed by CTM in this session (${T_REMOTE} turns it on or off)` : lastRemoteControl ? 'on' : 'off'}`,
+    `- Remote Control: ${describeRemote(m.remote)}`,
   ]
   if (m.setting !== null) lines.push(`- Model setting: ${m.setting}`)
   if (m.catalog) {
@@ -1374,6 +1377,31 @@ function remoteAnswer(text: string): 'on' | 'off' | null {
   return null
 }
 
+// Remote Control's state, as the engine shows it in the command list: while it is connected
+// /remote-control is described as "Disconnect Remote Control". 'unavailable': no such
+// command in this session; null: the list could not be read.
+type RemoteState = 'on' | 'off' | 'unavailable'
+async function remoteStatus($: EngineInterface): Promise<RemoteState | null> {
+  try {
+    const list = (await $.command.list()) as unknown as { name?: string; description?: string }[] | { deny?: string }
+    if (!Array.isArray(list)) return null
+    const cmd = list.find(c => c?.name === 'remote-control' || c?.name === '/remote-control')
+    if (!cmd) return 'unavailable'
+    const state = /^\s*disconnect\b/i.test(cmd.description ?? '') ? 'on' : 'off'
+    lastRemoteControl = state === 'on'
+    return state
+  } catch {
+    return null
+  }
+}
+
+function describeRemote(state: RemoteState | null): string {
+  if (state === 'on') return 'on (connected – the session can be followed from the phone or claude.ai/code)'
+  if (state === 'off') return 'off'
+  if (state === 'unavailable') return 'not available in this session (no /remote-control command here)'
+  return `unknown – the command list could not be read${lastRemoteControl === null ? '' : `; CTM last saw it ${lastRemoteControl ? 'on' : 'off'}`}`
+}
+
 async function runRemoteControl($: EngineInterface): Promise<{ text: string; state: 'on' | 'off' | null }> {
   let text = ''
   try {
@@ -1391,7 +1419,20 @@ async function setRemoteControl($: EngineInterface, on: boolean): Promise<{ ok: 
   const failed = (text: string, extra = '') =>
     `[CTM] Turning Remote Control ${want} as you scheduled failed. Command: /remote-control – the engine answered: ` +
     `${text ? `"${text}"` : 'nothing'}.${extra} Tell the user if they asked for it.`
+  const before = await remoteStatus($)
+  if (before === want) {
+    return { ok: true, note: `[CTM] Remote Control was already ${want}; nothing to do.` }
+  }
   const first = await runRemoteControl($)
+  // Where the command list can be read it is the witness: as asked, or unchanged (failed).
+  if (before === 'on' || before === 'off') {
+    const after = await remoteStatus($)
+    if (after === want) {
+      lastRemoteControl = on
+      return { ok: true, note: `[CTM] Remote Control was turned ${want} as you scheduled. The engine answered: "${first.text}"` }
+    }
+    if (after === before) return { ok: false, note: failed(first.text, ` Remote Control is still ${before}.`) }
+  }
   if (first.state === null) return { ok: false, note: failed(first.text, ' Remote Control is taken as unchanged.') }
   if (first.state === want) {
     lastRemoteControl = on
@@ -2136,6 +2177,15 @@ export const register: Register = (on, options) => {
       isDeferred: false,
     })
     await $.tool.register({
+      name: 'remote_control_status',
+      description:
+        'CTM: Shows right now whether Remote Control is on (connected: the user can follow and steer this session ' +
+        'from their phone or claude.ai/code), off, or not available in this session. Read-only; turn it on or off ' +
+        `with ${T_REMOTE}.`,
+      inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+      isDeferred: false,
+    })
+    await $.tool.register({
       name: 'remote_control',
       description:
         'CTM: Turns Remote Control on or off at the END of your current turn – for this session only. Remote Control ' +
@@ -2579,6 +2629,16 @@ export const register: Register = (on, options) => {
         'Finish your answer now; you will then get a message to carry on.',
     }
   }).catch(() => ({ deny: 'CTM: could not schedule the Ultracode change.' }))
+
+  on('tool.call', { tool: T_REMOTE_STATUS }, async $ => {
+    const state = await remoteStatus($)
+    const scheduled = pending?.remoteControl ?? null
+    return {
+      result:
+        `CTM Remote Control: ${describeRemote(state)}.` +
+        (scheduled === null ? '' : ` Scheduled for the end of this turn: Remote Control ${scheduled ? 'on' : 'off'}.`),
+    }
+  }).catch(() => ({ deny: 'CTM: could not read the Remote Control status.' }))
 
   on('tool.call', { tool: T_REMOTE }, async ($, e) => {
     if (e.agentId) return { deny: 'CTM: only the main agent may turn Remote Control on or off.' }

@@ -65,6 +65,8 @@ type WorldOpts = {
   refuseEffort?: string
   effort?: string
   refuseUltracode?: string
+  remoteOn?: boolean // Remote Control connected at the start
+  refuseRemote?: string // what /remote-control answers where it is not available
   // As in a remote session: an effort change turns Ultracode off, and says so.
   effortTurnsUltracodeOff?: boolean
 }
@@ -152,6 +154,12 @@ function world(on: On, initial: Usage = USAGE, opts: WorldOpts = {}) {
       }
       if (opts.refuseEffort) return { text: opts.refuseEffort }
       return { text: `Set effort level to ${e.args} (this session only): …${opts.effortTurnsUltracodeOff ? ' · Ultracode off' : ''}` }
+    }
+    if (e.command === 'remote-control') {
+      // A toggle, as /remote-control is: connects when off, disconnects when on.
+      if (opts.refuseRemote) return { text: opts.refuseRemote }
+      opts.remoteOn = !opts.remoteOn
+      return { text: opts.remoteOn ? 'Remote Control connected · claude.ai/code/session_x' : 'Remote Control disconnected' }
     }
     if (e.command === 'model') {
       // As /model answers: an unknown name or a policy refusal leaves the model as it was.
@@ -1341,6 +1349,83 @@ describe('set_ultracode', () => {
     on('session.start', () => ({ cwd: '/' }) as never)
     await $.session.start({ cwd: '/' } as never)
     expect(seen.tools.map(t => t.name)).toEqual(expect.arrayContaining(['set_effort', 'set_ultracode']))
+  })
+})
+
+describe('remote_control', () => {
+  const rc = (extra: Record<string, unknown>) => ({ tool: 'mcp__ctm__remote_control', ...extra }) as never
+
+  test('refuses anything but true or false, and subagents', async ($, on) => {
+    world(on)
+    mock.clock(on, { now: 1_000_000 })
+    expect((await $.tool.call(rc({ enabled: 'off' }))).deny).toMatch(/"enabled" must be true or false/)
+    expect((await $.tool.call(rc({ enabled: true, agentId: 'sub-1' }))).deny).toMatch(/main agent/)
+  })
+
+  test('turns Remote Control on after the turn and tells the model how it went', async ($, on) => {
+    const seen = world(on)
+    const clock = mock.clock(on, { now: 1_000_000 })
+    on('turn.complete', () => ({ text: '' }) as never)
+    const r = await $.tool.call(rc({ enabled: true }))
+    expect(String(r.result)).toContain('Remote Control on scheduled for the end of this turn')
+    await $.turn.complete(turn)
+    await clock.advance(2_000)
+    expect(seen.commands).toEqual(['remote-control'])
+    expect(seen.prompts[0]).toContain('[CTM] Remote Control was turned on as you scheduled.')
+    expect(String((await $.tool.call({ tool: 'mcp__ctm__models' } as never)).result)).toContain('- Remote Control: on')
+  })
+
+  test('already as asked: the toggle is run again to put it back', async ($, on) => {
+    const seen = world(on, USAGE, { remoteOn: true })
+    const clock = mock.clock(on, { now: 1_000_000 })
+    on('turn.complete', () => ({ text: '' }) as never)
+    await $.tool.call(rc({ enabled: true }))
+    await $.turn.complete(turn)
+    await clock.advance(2_000)
+    expect(seen.commands).toEqual(['remote-control', 'remote-control'])
+    expect(seen.prompts[0]).toContain('[CTM] Remote Control was already on; it stays on.')
+  })
+
+  test('turns it off', async ($, on) => {
+    const seen = world(on, USAGE, { remoteOn: true })
+    const clock = mock.clock(on, { now: 1_000_000 })
+    on('turn.complete', () => ({ text: '' }) as never)
+    await $.tool.call(rc({ enabled: false }))
+    await $.turn.complete(turn)
+    await clock.advance(2_000)
+    expect(seen.commands).toEqual(['remote-control'])
+    expect(seen.prompts[0]).toContain('[CTM] Remote Control was turned off as you scheduled.')
+  })
+
+  test('a failure comes back with the engine answer verbatim', async ($, on) => {
+    const seen = world(on, USAGE, { refuseRemote: "Remote Control is disabled by your organization's policy." })
+    const clock = mock.clock(on, { now: 1_000_000 })
+    on('turn.complete', () => ({ text: '' }) as never)
+    await $.tool.call(rc({ enabled: true }))
+    await $.turn.complete(turn)
+    await clock.advance(2_000)
+    expect(seen.commands).toEqual(['remote-control'])
+    expect(seen.prompts[0]).toContain(
+      `[CTM] Turning Remote Control on as you scheduled failed. Command: /remote-control – the engine answered: "Remote Control is disabled by your organization's policy.". Remote Control is taken as unchanged.`,
+    )
+  })
+
+  test('joins an effort change and runs after it', async ($, on) => {
+    const seen = world(on)
+    const clock = mock.clock(on, { now: 1_000_000 })
+    on('turn.complete', () => ({ text: '' }) as never)
+    await $.tool.call({ tool: 'mcp__ctm__set_effort', level: 'high' } as never)
+    expect(String((await $.tool.call(rc({ enabled: true }))).result)).toContain('added to what is already scheduled')
+    await $.turn.complete(turn)
+    await clock.advance(2_000)
+    expect(seen.commands).toEqual(['effort high', 'remote-control'])
+  })
+
+  test('the tool is registered', async ($, on) => {
+    const seen = world(on)
+    on('session.start', () => ({ cwd: '/' }) as never)
+    await $.session.start({ cwd: '/' } as never)
+    expect(seen.tools.map(t => t.name)).toEqual(expect.arrayContaining(['remote_control']))
   })
 })
 

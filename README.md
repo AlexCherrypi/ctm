@@ -3,7 +3,7 @@
 A Claude Code mod that keeps the model informed about its context window and the account's
 5-hour / 7-day rate limits, each with its change since the last report, in a short block – and
 lets the model compact or clear its own conversation, switch its own model, change its own
-effort or turn Ultracode on or off, always with a resume prompt so it carries on afterwards.
+effort, turn Ultracode on or off or turn Remote Control on or off, always with a resume prompt so it carries on afterwards.
 
 ## What the model sees
 
@@ -154,8 +154,21 @@ legend is then in the system prompt as usual.
     told so. Dropped if you interrupt the turn.
   - `mcp__ctm__models` shows Ultracode as CTM last set it; until then the engine's own system
     reminders tell the model whether it is on.
+- `mcp__ctm__remote_control` `{ enabled, resumePrompt? }` – turns Remote Control (following and
+  steering the session from the phone or claude.ai/code) on or off, e.g. when you tell the model
+  "turn Remote Control off", or when its instructions say to turn it on for certain work.
+  - Runs as `/remote-control` at the end of the turn, **for this session only**; then the model gets
+    a message with the result and carries on (its `resumePrompt`, or "carry on and tell the user how
+    it went").
+  - `/remote-control` is a toggle and plugins cannot read its state, so CTM reads the engine's
+    answer: if it went the other way (Remote Control already was as asked), CTM runs it once more
+    to put it back.
+  - If it fails (not available in this session, disabled by the organization, not signed in, …),
+    the engine's answer comes back verbatim, so the model can report it.
+  - Main agent only, no gap; joins a reset, model switch, effort or Ultracode change scheduled in
+    the same turn and runs last. `mcp__ctm__models` shows its state as CTM last saw it.
 
-You get a toast whenever the model schedules a reset, a model switch, an effort or Ultracode change, turns idle updates on, changes the
+You get a toast whenever the model schedules a reset, a model switch, an effort, Ultracode or Remote Control change, turns idle updates on, changes the
 settings, or arms or fires a limit wake-up.
 
 ## Thresholds and wake-ups

@@ -41,12 +41,13 @@ import type { IdleWatch, KeptBriefing, KeptIdleUpdates, KeptWakeups, LimitKind, 
 type Mode = 'compact' | 'clear'
 // What runs at the end of the turn, in this order: a compact or clear, a model switch,
 // an effort change (its levels depend on the model), Ultracode on or off (an effort
-// change may turn it off). Any of them may be left out.
+// change may turn it off), Remote Control on or off. Any of them may be left out.
 type PendingReset = {
   mode: Mode | null
   model: string | null
   effort: string | null
   ultracode: boolean | null
+  remoteControl: boolean | null // Remote Control on or off, last of all
   instructions: string | null
   resumePrompt: string
 }
@@ -81,6 +82,7 @@ const T_MODELS = 'mcp__ctm__models'
 const T_SWITCH = 'mcp__ctm__switch_model'
 const T_EFFORT = 'mcp__ctm__set_effort'
 const T_ULTRACODE = 'mcp__ctm__set_ultracode'
+const T_REMOTE = 'mcp__ctm__remote_control'
 // The account-switcher plugin's tools: where it is installed, a block past a pause mark
 // points the main agent to another of the person's accounts before asking it to pause.
 const T_SWITCHER_ACCOUNTS = 'mcp__account-switcher__accounts'
@@ -133,6 +135,7 @@ let lastEffortAt = Number.NEGATIVE_INFINITY
 let lastEffort: string | null = null // the main loop's effort, as its last model request carried it
 let lastUltracodeAt = Number.NEGATIVE_INFINITY
 let lastUltracode: boolean | null = null // Ultracode as CTM last set it; null: not set by CTM
+let lastRemoteControl: boolean | null = null // Remote Control as CTM last saw it; null: not known
 // The engine's model list, kept for CATALOG_TTL_MS – a failed fetch too, so a host where
 // it does not work is not asked again on every call.
 let catalog: { at: number; list: Promise<CatalogEntry[] | null> } | null = null
@@ -212,6 +215,7 @@ const INFO = [
   `- ${T_MODELS}: your current model and effort, and the models you can switch to with what each is good for. ${T_SWITCH}: switches the model at the end of your turn – alone or together with a compact/clear (cheaper: the new model then re-caches only the smaller conversation) – and sends you your resumePrompt afterwards, as a reset does. Switch to a smaller model for simple, routine work, to a larger one for hard problems.`,
   `- ${T_EFFORT}: raises or lowers how long you think, from the end of your turn on, then you carry on. Raise it when your solutions stay half-baked or the problem is harder than it looked; lower it for routine work.`,
   `- ${T_ULTRACODE}: turns Ultracode (multi-agent workflows on every substantive task) on or off for this session, from the end of your turn on, then you carry on. It does not depend on the effort. Turn it on for exhaustive work – broad audits, migrations, hard multi-part problems – and off for routine work or when a limit runs high: workflows cost far more quota.`,
+  `- ${T_REMOTE}: turns Remote Control (this session controlled from the phone or claude.ai/code) on or off at the end of your turn; you then get the result – including the engine's answer if it failed – and carry on. Use it when the user or your instructions ask for it.`,
   '- If the user told you to stay on a model, an effort level or an Ultracode setting, do not change it yourself.',
   `- ${T_SETTINGS}: how often these blocks come (1–${MAX_INTERVAL_MINUTES} min), a compact threshold (tokens like 300k, or a % of the window), and pause thresholds for the 5-hour and 7-day limits. No arguments = show the current settings. Kept across sessions.`,
   '- Past the compact threshold the blocks remind you to compact: do it at the next clean point if your task allows it (a smaller context makes every further request cheaper on the limits) – never break off critical work for it.',
@@ -1164,6 +1168,7 @@ function describeModels(m: ModelInfo): string {
     `- Current model (main agent): ${m.current ?? 'unknown'}`,
     `- Current effort: ${m.effort ?? 'unknown (the model may have no effort levels)'}`,
     `- Ultracode: ${m.ultracode === null ? 'not changed by CTM in this session (the system reminders say whether it is on)' : m.ultracode ? 'on' : 'off'}`,
+    `- Remote Control: ${lastRemoteControl === null ? `not changed by CTM in this session (${T_REMOTE} turns it on or off)` : lastRemoteControl ? 'on' : 'off'}`,
   ]
   if (m.setting !== null) lines.push(`- Model setting: ${m.setting}`)
   if (m.catalog) {
@@ -1356,14 +1361,73 @@ async function setUltracode($: EngineInterface, on: boolean): Promise<{ ok: bool
   }
 }
 
+// Remote Control through /remote-control – a toggle: it connects when off and disconnects
+// when on, takes no on/off argument, and the engine offers plugins no way to read its
+// state. So CTM runs it once and reads the answer: where it went the other way (Remote
+// Control was already as asked), it runs it again to put it back. An answer that says
+// neither – refused by policy, not available here, not signed in, a dialog – comes back
+// verbatim, and Remote Control is taken as unchanged.
+function remoteAnswer(text: string): 'on' | 'off' | null {
+  if (/\b(not available|disabled|unavailable|only available|must be logged in|not logged in|failed|error|cannot|can't|couldn't|unable)\b/i.test(text)) return null
+  if (/\bdisconnect(ed|ing)?\b|\b(turned|is now|now) off\b|\bstopped\b/i.test(text)) return 'off'
+  if (/\b(connected|connecting|active|enabled|ready|running|started|turned on|is now on)\b|claude\.ai\/code/i.test(text)) return 'on'
+  return null
+}
+
+async function runRemoteControl($: EngineInterface): Promise<{ text: string; state: 'on' | 'off' | null }> {
+  let text = ''
+  try {
+    const r = await $.command.run({ command: 'remote-control' })
+    refusedBy(r)
+    text = (r.text ?? '').trim()
+  } catch (err) {
+    text = errorText(err)
+  }
+  return { text, state: remoteAnswer(text) }
+}
+
+async function setRemoteControl($: EngineInterface, on: boolean): Promise<{ ok: boolean; note: string }> {
+  const want = on ? 'on' : 'off'
+  const failed = (text: string, extra = '') =>
+    `[CTM] Turning Remote Control ${want} as you scheduled failed. Command: /remote-control – the engine answered: ` +
+    `${text ? `"${text}"` : 'nothing'}.${extra} Tell the user if they asked for it.`
+  const first = await runRemoteControl($)
+  if (first.state === null) return { ok: false, note: failed(first.text, ' Remote Control is taken as unchanged.') }
+  if (first.state === want) {
+    lastRemoteControl = on
+    return { ok: true, note: `[CTM] Remote Control was turned ${want} as you scheduled. The engine answered: "${first.text}"` }
+  }
+  // It was already as asked, and the toggle went the other way: put it back.
+  const back = await runRemoteControl($)
+  if (back.state === want) {
+    lastRemoteControl = on
+    return { ok: true, note: `[CTM] Remote Control was already ${want}; it stays ${want}. The engine answered: "${back.text}"` }
+  }
+  lastRemoteControl = first.state === 'on'
+  return {
+    ok: false,
+    note: failed(
+      back.text,
+      ` Remote Control was already ${want}; the first /remote-control turned it ${first.state} ("${first.text}"), and turning it back failed – it is now likely ${first.state}.`,
+    ),
+  }
+}
+
 // ---------------------------------------------------------------- Reset (runs after the turn)
 
-function describeJob(job: { mode: Mode | null; model: string | null; effort: string | null; ultracode: boolean | null }): string {
+function describeJob(job: {
+  mode: Mode | null
+  model: string | null
+  effort: string | null
+  ultracode: boolean | null
+  remoteControl: boolean | null
+}): string {
   return [
     job.mode,
     job.model ? `model switch to ${job.model}` : null,
     job.effort ? `effort ${job.effort}` : null,
     job.ultracode === null ? null : `Ultracode ${job.ultracode ? 'on' : 'off'}`,
+    job.remoteControl === null ? null : `Remote Control ${job.remoteControl ? 'on' : 'off'}`,
   ]
     .filter(Boolean)
     .join(' + ')
@@ -1435,6 +1499,11 @@ async function deliverResume($: EngineInterface, job: PendingReset, note: string
     const fix = !uc.ok && ultracodeOff ? uc.note.replace('Ultracode is unchanged.', 'Ultracode is off: the effort change before it turned it off.') : uc.note
     note = note ? `${note}\n${fix}` : fix
   }
+  if (job.remoteControl !== null) {
+    const rc = await setRemoteControl($, job.remoteControl)
+    if (!rc.ok) toast($, `CTM: Remote Control ${job.remoteControl ? 'on' : 'off'} failed`)
+    note = note ? `${note}\n${rc.note}` : rc.note
+  }
   const now = await $.clock.now()
   if (job.mode || job.model) lastResetAt = now
   if (job.effort) lastEffortAt = now
@@ -1452,6 +1521,7 @@ async function failReset($: EngineInterface, job: PendingReset, message: string)
     job.model ? `model switch to "${job.model}"` : null,
     job.effort ? `effort change to "${job.effort}"` : null,
     job.ultracode === null ? null : `Ultracode ${job.ultracode ? 'on' : 'off'}`,
+    job.remoteControl === null ? null : `Remote Control ${job.remoteControl ? 'on' : 'off'}`,
   ]
     .filter(Boolean)
     .join(' and ')
@@ -1504,7 +1574,7 @@ async function runReset($: EngineInterface): Promise<void> {
   if (busy) return // a new turn is already running: try again at its turn.complete
   pending = null
 
-  if (job.mode === null) return deliverResume($, job, '') // a model, effort and/or Ultracode change alone
+  if (job.mode === null) return deliverResume($, job, '') // a model, effort, Ultracode and/or Remote Control change alone
   if (job.mode === 'clear') return runAsCommand($, { ...job, mode: job.mode })
 
   try {
@@ -2065,6 +2135,35 @@ export const register: Register = (on, options) => {
       },
       isDeferred: false,
     })
+    await $.tool.register({
+      name: 'remote_control',
+      description:
+        'CTM: Turns Remote Control on or off at the END of your current turn – for this session only. Remote Control ' +
+        'lets the user follow and steer this session from their phone or claude.ai/code. Afterwards you automatically ' +
+        'get a message with the result and carry on (with resumePrompt if you give one). Finish your answer promptly ' +
+        'after calling this.\n' +
+        '- Use it when the user asks you to ("turn Remote Control off"), or when your instructions say to turn it on or ' +
+        'off for certain work.\n' +
+        '- If it fails (not available in this session, turned off by the organization, not signed in to claude.ai, ' +
+        "...), the message gives the engine's answer verbatim: report it to the user and do not retry blindly.\n" +
+        '- If Remote Control already is as asked, it stays so.\n' +
+        'Joins a reset, model switch, effort or Ultracode change scheduled in the same turn and runs last. Main agent only.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          enabled: { type: 'boolean', description: 'true: Remote Control on; false: off.' },
+          resumePrompt: {
+            type: 'string',
+            description:
+              'Optional: what to continue with once Remote Control is on or off. Your conversation stays as it is, ' +
+              'so the next step is enough. Left out: you are told to carry on where you left off.',
+          },
+        },
+        required: ['enabled'],
+        additionalProperties: false,
+      },
+      isDeferred: false,
+    })
     await safe(() =>
       $.command.register({
         name: 'ctm',
@@ -2251,7 +2350,7 @@ export const register: Register = (on, options) => {
     if (wait > 0) return { deny: `CTM: the last reset was too recent. Next one possible ${fmtIn(wait)}.` }
 
     const replaced = pending !== null
-    pending = { mode, model: null, effort: null, ultracode: pending?.ultracode ?? null, instructions: mode === 'compact' ? instructions : null, resumePrompt }
+    pending = { mode, model: null, effort: null, ultracode: pending?.ultracode ?? null, remoteControl: pending?.remoteControl ?? null, instructions: mode === 'compact' ? instructions : null, resumePrompt }
     toast($, `CTM: the model scheduled a ${mode} for the end of this turn`)
     return {
       result:
@@ -2405,7 +2504,7 @@ export const register: Register = (on, options) => {
         deny: `CTM: ${model} does not support effort "${effort}" (it supports ${target.supportedEffortLevels.join(', ')}) – nothing was scheduled.`,
       }
     }
-    pending = { mode, model, effort, ultracode: pending?.ultracode ?? null, instructions: mode === 'compact' ? instructions : null, resumePrompt }
+    pending = { mode, model, effort, ultracode: pending?.ultracode ?? null, remoteControl: pending?.remoteControl ?? null, instructions: mode === 'compact' ? instructions : null, resumePrompt }
     toast($, `CTM: the model scheduled a ${describeJob(pending)} for the end of this turn`)
     return {
       result:
@@ -2445,7 +2544,7 @@ export const register: Register = (on, options) => {
     // Joins a reset or model switch already scheduled for this turn; else stands alone.
     pending = pending
       ? { ...pending, effort: level, resumePrompt: given ? `${pending.resumePrompt}\n\n${given}` : pending.resumePrompt }
-      : { mode: null, model: null, effort: level, ultracode: null, instructions: null, resumePrompt }
+      : { mode: null, model: null, effort: level, ultracode: null, remoteControl: null, instructions: null, resumePrompt }
     toast($, `CTM: the model scheduled effort ${level} for the end of this turn`)
     return {
       result:
@@ -2471,7 +2570,7 @@ export const register: Register = (on, options) => {
     // Joins a reset, model switch or effort change already scheduled for this turn; else stands alone.
     pending = pending
       ? { ...pending, ultracode: enabled, resumePrompt: given ? `${pending.resumePrompt}\n\n${given}` : pending.resumePrompt }
-      : { mode: null, model: null, effort: null, ultracode: enabled, instructions: null, resumePrompt }
+      : { mode: null, model: null, effort: null, ultracode: enabled, remoteControl: null, instructions: null, resumePrompt }
     toast($, `CTM: the model scheduled Ultracode ${state} for the end of this turn`)
     return {
       result:
@@ -2480,6 +2579,29 @@ export const register: Register = (on, options) => {
         'Finish your answer now; you will then get a message to carry on.',
     }
   }).catch(() => ({ deny: 'CTM: could not schedule the Ultracode change.' }))
+
+  on('tool.call', { tool: T_REMOTE }, async ($, e) => {
+    if (e.agentId) return { deny: 'CTM: only the main agent may turn Remote Control on or off.' }
+    const input = e as unknown as { enabled?: unknown; resumePrompt?: unknown }
+    const enabled = input.enabled
+    if (typeof enabled !== 'boolean') return { deny: 'CTM: "enabled" must be true or false.' }
+    const state = enabled ? 'on' : 'off'
+    const given = typeof input.resumePrompt === 'string' ? input.resumePrompt.trim() : ''
+    const resumePrompt = given || `Carry on with your task where you left off; tell the user how turning Remote Control ${state} went.`
+
+    const replaced = pending !== null
+    // Joins whatever is already scheduled for this turn; else stands alone.
+    pending = pending
+      ? { ...pending, remoteControl: enabled, resumePrompt: given ? `${pending.resumePrompt}\n\n${given}` : pending.resumePrompt }
+      : { mode: null, model: null, effort: null, ultracode: null, remoteControl: enabled, instructions: null, resumePrompt }
+    toast($, `CTM: the model scheduled Remote Control ${state} for the end of this turn`)
+    return {
+      result:
+        `CTM: Remote Control ${state} scheduled for the end of this turn` +
+        `${replaced ? '; added to what is already scheduled' : ''}. ` +
+        'Finish your answer now; you will then get a message with the result to carry on.',
+    }
+  }).catch(() => ({ deny: 'CTM: could not schedule the Remote Control change.' }))
 
   // The main loop's effort, as each of its model requests carries it. A main step also
   // means a main turn runs – a fresh copy of the module may not have heard its start.

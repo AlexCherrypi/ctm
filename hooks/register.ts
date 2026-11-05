@@ -1371,8 +1371,11 @@ async function setUltracode($: EngineInterface, on: boolean): Promise<{ ok: bool
 // neither – refused by policy, not available here, not signed in, a dialog – comes back
 // verbatim, and Remote Control is taken as unchanged.
 function remoteAnswer(text: string): 'on' | 'off' | null {
-  if (/\b(not available|disabled|unavailable|only available|must be logged in|not logged in|failed|error|cannot|can't|couldn't|unable)\b/i.test(text)) return null
-  if (/\bdisconnect(ed|ing)?\b|\b(turned|is now|now) off\b|\bstopped\b/i.test(text)) return 'off'
+  // Wordings as the engine has them, e.g. "Remote Control is disabled by your organization's
+  // policy.", "… is not available inside a cloud session.", "… could not verify the signed-in
+  // account", "… denied: …", "… asks for a one-time confirmation …, and this session can't show it".
+  if (/\b(not available|disabled|unavailable|only available|must be logged in|not logged in|failed|failure|error|denied|invalid|unexpected|cannot|can't|can\u2019t|could not|couldn't|unable)\b/i.test(text)) return null
+  if (/\bdisconnect(ed|ing)?\b|\bnot connected\b|\b(turned|is now|now|is) off\b|\bstopped\b/i.test(text)) return 'off'
   if (/\b(connected|connecting|active|enabled|ready|running|started|turned on|is now on)\b|claude\.ai\/code/i.test(text)) return 'on'
   return null
 }

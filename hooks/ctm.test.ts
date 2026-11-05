@@ -1454,6 +1454,26 @@ describe('remote_control', () => {
     )
   })
 
+  for (const text of [
+      'Remote Control is not available inside a cloud session.',
+      'Remote Control could not verify the signed-in account \u2014 run /remote-control to reconnect',
+      'Remote Control denied: policy cache miss (transient)',
+      "Remote Control asks for a one-time confirmation before it's first enabled, and this session can't show it. Run /remote-control from an interactive Claude Code session.",
+      'Error: You must be logged in to use Remote Control.',
+    'Remote Control is not connected',
+  ]) {
+    test(`a real engine wording is a failure: ${text.slice(0, 50)}`, async ($, on) => {
+      const seen = world(on, USAGE, { refuseRemote: text, noCommandList: true })
+      const clock = mock.clock(on, { now: 1_000_000 })
+      on('turn.complete', () => ({ text: '' }) as never)
+      await $.tool.call(rc({ enabled: true }))
+      await $.turn.complete(turn)
+      await clock.advance(2_000)
+      expect(seen.prompts.at(-1)).toContain('[CTM] Turning Remote Control on as you scheduled failed.')
+      expect(seen.prompts.at(-1)).toContain(`the engine answered: "${text}"`)
+    })
+  }
+
   test('joins an effort change and runs after it', async ($, on) => {
     const seen = world(on)
     const clock = mock.clock(on, { now: 1_000_000 })
